@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/logo.png" alt="Antigravity Codex Subagent Logo" width="128" />
+</p>
+
 # Antigravity Codex Subagent（`v0.4.0`）
 
 [English](./README.md) | **简体中文**
