@@ -1,0 +1,29 @@
+{
+  "name": "antigravity-codex-subagent",
+  "version": "0.4.0",
+  "type": "module",
+  "license": "MIT",
+  "description": "Persistent Codex subagent MCP server plugin for Antigravity over the official @openai/codex app-server protocol",
+  "keywords": [
+    "antigravity",
+    "codex",
+    "openai-codex",
+    "mcp",
+    "subagent"
+  ],
+  "homepage": "https://github.com/Kiraliang954321/antigravity-codex-subagent#readme",
+  "bugs": {
+    "url": "https://github.com/Kiraliang954321/antigravity-codex-subagent/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kiraliang954321/antigravity-codex-subagent.git"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node test/run-all.mjs",
+    "test:unit": "node test/run-all.mjs --unit-only"
+  }
+}

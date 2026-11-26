@@ -1,0 +1,12 @@
+{
+  "name": "codex-subagent",
+  "displayName": "Codex Subagent",
+  "version": "0.4.0",
+  "description": "Persistent Codex subagent MCP tool over the official Codex app-server protocol with sessionKey/threadId persistence, streaming/plan/diff telemetry, MCP progress notifications, protocol-level sandbox switching, multimodal local images, JSON Schema outputSchema, live turn steering, in-place context compaction, thread forking, restart-resilient background jobs, and opt-in warm workers.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Use subagent_codex in read-only sandbox mode to inspect this repository and summarize its architecture",
+    "Continue our previous Codex analysis using the same sessionKey (or compact/fork it when needed)",
+    "List active persistent Codex subagent sessions and close any finished ones"
+  ]
+}

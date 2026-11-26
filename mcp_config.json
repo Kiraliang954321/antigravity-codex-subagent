@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "codex-subagent": {
+      "command": "node",
+      "type": "stdio",
+      "args": [
+        "mcp/server.mjs"
+      ],
+      "env": {
+        "CODEX_PERMISSION_MODE": "never",
+        "CODEX_EOF_GRACE_MS": "6000",
+        "CODEX_WARM_IDLE_MS": "180000"
+      }
+    }
+  }
+}
