@@ -149,11 +149,11 @@ function getProcessStartTimeMs(pid) {
           '-NoProfile',
           '-NonInteractive',
           '-Command',
-          `([DateTimeOffset](Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()`,
+          `([DateTimeOffset]([System.Diagnostics.Process]::GetProcessById(${pid}).StartTime.ToUniversalTime())).ToUnixTimeMilliseconds()`,
         ],
         {
           encoding: 'utf8',
-          timeout: 3000,
+          timeout: 10_000,
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'ignore'],
         },
