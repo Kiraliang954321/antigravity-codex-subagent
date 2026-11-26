@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
   closeSync,
@@ -123,6 +124,8 @@ function atomicWriteJson(filePath, payload) {
   }
 }
 
+const PID_REUSE_SKEW_MS = 2_000;
+
 function isPidAlive(pid) {
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
   try {
@@ -130,6 +133,50 @@ function isPidAlive(pid) {
     return true;
   } catch (error) {
     return error?.code !== 'ESRCH';
+  }
+}
+
+function getProcessStartTimeMs(pid) {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (process.platform === 'win32') {
+      const psBin = process.env.SystemRoot
+        ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        : 'powershell.exe';
+      const out = execFileSync(
+        psBin,
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `([DateTimeOffset](Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()`,
+        ],
+        {
+          encoding: 'utf8',
+          timeout: 3000,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'ignore'],
+        },
+      ).trim();
+      const ms = Number(out);
+      return Number.isFinite(ms) ? ms : null;
+    }
+
+    const out = execFileSync(
+      'ps',
+      ['-p', String(pid), '-o', 'lstart='],
+      {
+        encoding: 'utf8',
+        timeout: 3000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, LC_ALL: 'C', TZ: 'UTC' },
+      },
+    ).trim();
+    if (!out) return null;
+    const ms = Date.parse(`${out.replace(/\s+/g, ' ')} UTC`);
+    return Number.isFinite(ms) ? ms : null;
+  } catch {
+    return null;
   }
 }
 
@@ -153,7 +200,21 @@ function isLockFileStale(lockFilePath) {
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
     return false;
   }
-  return !isPidAlive(pid);
+  if (!isPidAlive(pid)) {
+    return true;
+  }
+  if (pid === process.pid) {
+    return false;
+  }
+  const lockStartedAtMs = typeof parsed.startedAt === 'string' ? Date.parse(parsed.startedAt) : Number.NaN;
+  if (!Number.isFinite(lockStartedAtMs)) {
+    return false;
+  }
+  const procStartMs = getProcessStartTimeMs(pid);
+  if (procStartMs === null) {
+    return !isPidAlive(pid);
+  }
+  return procStartMs > lockStartedAtMs + PID_REUSE_SKEW_MS;
 }
 
 function atomicCreateExclusiveFile(targetPath, payload) {

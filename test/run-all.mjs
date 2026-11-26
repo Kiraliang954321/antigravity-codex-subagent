@@ -889,6 +889,76 @@ await test('9. Session store: maxSessions reservation, close() rollback, TTL re-
   } finally {
     await store2.dispose();
   }
+
+  const peer = spawn(
+    process.execPath,
+    ['-e', "process.stdout.write('READY\\n'); setInterval(() => {}, 1000);"],
+    { stdio: ['ignore', 'pipe', 'ignore'] },
+  );
+  try {
+    await new Promise((resolve, reject) => {
+      let out = '';
+      const timer = setTimeout(() => reject(new Error('peer process did not become ready in time')), 5000);
+      const cleanup = () => {
+        clearTimeout(timer);
+        peer.stdout.off('data', onData);
+        peer.off('error', onErr);
+        peer.off('exit', onExit);
+      };
+      const onData = (chunk) => {
+        out += chunk.toString('utf8');
+        if (out.includes('READY')) {
+          cleanup();
+          resolve();
+        }
+      };
+      const onErr = (err) => { cleanup(); reject(err); };
+      const onExit = (code) => { cleanup(); reject(new Error(`peer exited early (${code})`)); };
+      peer.stdout.on('data', onData);
+      peer.once('error', onErr);
+      peer.once('exit', onExit);
+    });
+
+    const storePath3 = path.join(dir, 'sessions-pid-reuse.json');
+    writeFileSync(
+      `${storePath3}.lock`,
+      JSON.stringify({ pid: peer.pid, startedAt: new Date(Date.now() - 60_000).toISOString(), token: 'reused-pid' }),
+      'utf8',
+    );
+    const store3 = await storeMod.openCodexSessionStore({ file: storePath3 });
+    try {
+      const lockOwner = JSON.parse(readFileSync(`${storePath3}.lock`, 'utf8'));
+      assert.equal(lockOwner.pid, process.pid);
+    } finally {
+      await store3.dispose();
+    }
+
+    writeFileSync(
+      `${storePath3}.lock`,
+      JSON.stringify({ pid: peer.pid, startedAt: new Date().toISOString(), token: 'live-peer' }),
+      'utf8',
+    );
+    await assert.rejects(
+      storeMod.openCodexSessionStore({ file: storePath3 }),
+      (err) => err?.code === storeMod.CODEX_ERROR_CODES.STORAGE_UNAVAILABLE,
+    );
+  } finally {
+    if (peer.exitCode === null && peer.signalCode === null) {
+      await new Promise((resolve) => {
+        const tKill = setTimeout(resolve, 2000);
+        peer.once('exit', () => {
+          clearTimeout(tKill);
+          resolve();
+        });
+        try {
+          peer.kill();
+        } catch {
+          clearTimeout(tKill);
+          resolve();
+        }
+      });
+    }
+  }
 });
 
 await test('12. Streaming delta heartbeats, turn/plan/updated, turn/diff/updated privacy, & MCP notifications/progress', async () => {
