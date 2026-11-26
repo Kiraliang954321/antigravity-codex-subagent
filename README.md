@@ -1,5 +1,7 @@
 # Antigravity Codex Subagent (`v0.4.0`)
 
+**English** | [简体中文](./README.zh-CN.md)
+
 Standalone Node.js stdio MCP server plugin for **Antigravity** that delegates tasks to an independent OpenAI Codex subagent over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol.
 
 Supports persistent multi-turn threads (`sessionKey` / `threadId`), protocol-level sandbox switching (`read-only` / `workspace-write` / `danger-full-access`), multimodal local image inputs, JSON Schema `outputSchema`, live progress & streaming telemetry, MCP `notifications/progress`, mid-turn steering (`steer`), in-place context compaction (`compact`), thread branching (`fork`), crash/restart recovery, and an opt-in warm worker pool.
