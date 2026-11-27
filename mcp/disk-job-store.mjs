@@ -231,7 +231,7 @@ export function createDiskJobStore(jobsDir, {
     }
   };
 
-  const listUnclaimed = (excludeJobIds = new Set()) => {
+  const listUnclaimed = (excludeJobIds = new Set(), { includeConversationId = false } = {}) => {
     if (!existsSync(jobsDir)) return [];
     let names;
     try {
@@ -276,6 +276,7 @@ export function createDiskJobStore(jobsDir, {
       }
       out.push({
         jobId: parsed.jobId,
+        ...(includeConversationId && typeof parsed.conversationId === 'string' ? { conversationId: parsed.conversationId } : {}),
         description: parsed.description ?? '',
         sessionKey: parsed.sessionKey ?? null,
         threadId: parsed.threadId ?? null,

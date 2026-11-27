@@ -5,7 +5,7 @@ description: Delegate coding, debugging, review, or analysis tasks to an indepen
 
 # Codex Subagent (`subagent_codex`)
 
-This plugin exposes the `codex-subagent` engine (`0.4.0`) to Antigravity through the `codex-subagent` MCP server over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol.
+This plugin exposes the `codex-subagent` engine (`0.5.0`) to Antigravity through the `codex-subagent` MCP server over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol, including a built-in Antigravity MCP App monitor UI (`ui://codex-subagent/monitor.html`).
 
 ## Available Tools
 
@@ -47,6 +47,15 @@ Continues waiting for, steers mid-turn, or cancels a background Codex job starte
 
 Takes `{}` and lists both persistent Codex threads (`sessions`, including `used` / `contextWindow`) and any running or unclaimed background jobs (`activeJobs`, including live `telemetry` with `phase`, `plan`, `diffSummary`, `idleMs`, `tokenUsage`, and `persisted: true` receipts recovered from disk).
 
+### 4. `subagent_codex_monitor`
+
+Opens the built-in Antigravity **MCP App** Monitor UI (`ui://codex-subagent/monitor.html`), which is also directly launchable with `{}` from Antigravity's **Aux Pane `+` menu** (`Codex Monitor`) or the **left sidebar** (`Codex Subagent`). Shows real-time **Gemini ↔ Codex** conversation timelines, execution plans, thinking/command streams, clickable changed workspace files (`toggle-aux-pane`), context window bars, and direct UI controls (`Steer`, `Cancel`, `Compact`, `Fork`, `Close`, and `Clear History`).
+
+**Optional arguments:**
+- `conversationId`: Explicit monitor conversation ID (`session:<sessionKey>`, `thread:<threadId>`, or `ephemeral:<jobId>`).
+- `sessionKey`: Persistent session key to focus on.
+- `jobId`: Running or unclaimed background job ID to focus on.
+
 ## Usage Rules
 
 1. **Handling long Codex runs, live telemetry, & steering (`status: "running"`):**
@@ -67,4 +76,4 @@ Takes `{}` and lists both persistent Codex threads (`sessions`, including `used`
    - Resuming, compacting, forking, or closing a persistent session requires the same `cwd` that originally created it (`CODEX_THREAD_CWD_MISMATCH` otherwise).
    - When finished, call `subagent_codex` with `{ action: "close", cwd, sessionKey }` (or `threadId`).
 6. **Tool discovery:**
-   - Antigravity registers the plugin's MCP server as `codex-subagent_codex-subagent`. Call `subagent_codex`, `subagent_codex_wait`, or `subagent_codex_list_sessions` via `call_mcp_tool` on `ServerName: "codex-subagent_codex-subagent"`.
+   - Antigravity registers the plugin's MCP server as `codex-subagent_codex-subagent`. Call `subagent_codex`, `subagent_codex_wait`, `subagent_codex_list_sessions`, or `subagent_codex_monitor` via `call_mcp_tool` on `ServerName: "codex-subagent_codex-subagent"`.

@@ -2,13 +2,13 @@
   <img src="./assets/logo.png" alt="Antigravity Codex Subagent Logo" width="128" />
 </p>
 
-# Antigravity Codex Subagent（`v0.4.0`）
+# Antigravity Codex Subagent（`v0.5.0`）
 
 [English](./README.md) | **简体中文**
 
-面向 **Antigravity** 的独立 Node.js stdio MCP 服务器插件，通过 `@openai/codex` 官方 `app-server --stdio` JSON-RPC v2 协议将编码、排查或分析任务委托给独立的 OpenAI Codex 子代理执行。
+面向 **Antigravity** 的独立 Node.js stdio MCP 服务器与 **MCP App 可视化插件**，通过 `@openai/codex` 官方 `app-server --stdio` JSON-RPC v2 协议将编码、排查或分析任务委托给独立的 OpenAI Codex 子代理执行，并内置可视化的 **Codex 监工台（Codex Monitor）**（支持侧边辅助面板 `+` 菜单和左侧全局导航栏）。
 
-支持跨轮持久会话（`sessionKey` / `threadId`）、协议级沙箱切换（`read-only` / `workspace-write` / `danger-full-access`）、本地多模态图片输入（`images`）、JSON Schema 结构化输出约束（`outputSchema`）、实时进度与流式增量遥测、MCP `notifications/progress` 通知、运行中纠偏（`steer`）、上下文原地压缩（`compact`）、会话分叉（`fork`）、崩溃/重启恢复，以及按需开启的温池保活（Warm Worker Pool）。
+支持跨轮持久会话（`sessionKey` / `threadId`）、Gemini ↔ Codex 实时双边对话与遥测时间线、UI 界面实时纠偏（`steer`）、点击变更文件直达侧栏源码视图、协议级沙箱切换（`read-only` / `workspace-write` / `danger-full-access`）、本地多模态图片输入（`images`）、JSON Schema 结构化输出约束（`outputSchema`）、MCP `notifications/progress` 通知、上下文原地压缩（`compact`）、会话分叉（`fork`）、崩溃/重启恢复，以及按需开启的温池保活（Warm Worker Pool）。
 
 ## 前置要求
 
@@ -44,6 +44,16 @@
   - **线程生命周期管理**：支持原地压缩（`action: "compact"`）、会话分叉（`action: "fork"`，需传 `targetSessionKey`，可选 `lastTurnId`）以及归档清理（`action: "close"`）。
 - `subagent_codex_wait`：当 `subagent_codex` 超出同步等待窗口返回 `status: "running"`、`jobId` 及实时 `telemetry`（包含 `turnId`、`phase`、`lastActivityAt`、单调递增的 `idleMs`、`currentActivity`、`activeCount`、5 条 `recentActivities` 环形缓冲、`plan`、`diffSummary`、`tokenUsage`）时，继续轮询等待、运行中纠偏（`steer` + 可选 `images`）或取消任务。尚未认领的已结束任务回执会原子持久化到隔离的目录（`data/jobs/<store>-<hash>/<jobId>.json`，保留 30 分钟），确保跨越 MCP 服务重启仍可找回结果；当请求附带 `_meta.progressToken` 时还会按节流周期发送 MCP `notifications/progress`。
 - `subagent_codex_list_sessions`：查看所有持久化 Codex 会话（`sessions`，含 `used` 与 `contextWindow`）以及运行中或待认领的后台任务（`activeJobs`，含实时遥测与磁盘恢复的待认领回执）。
+- `subagent_codex_monitor`：唤出内置的 Antigravity **MCP App** 可视化监工台（`ui://codex-subagent/monitor.html`），也可直接从 Antigravity 右侧辅助面板的 **`+` 菜单**（`Codex Monitor`）或**左侧主导航栏**（`Codex Subagent`）无参启动。面板交互由 4 个仅对 UI 开放、对 Gemini 隐藏（`visibility: ["app"]`）的工具驱动（`codex_ui_list_conversations`、`codex_ui_get_conversation`、`codex_ui_steer`、`codex_ui_action`），既可实时观测过程与控制任务，又不会污染主对话上下文。
+
+## Codex 监工台可视化界面（`v0.5.0`）
+
+在右侧辅助面板点击 **`+`** 菜单选择 **Codex Monitor**（单会话侧边栏），或在左侧导航栏点击 **Codex Subagent**（全局多会话管理视图）：
+
+- **Gemini ↔ Codex 双边对话时间轴**：直观呈现派单 Prompt 与沙箱/模型/推理深度徽章、执行计划勾选清单、可折叠的推理思考与终端命令输出流、Unified Diff 预览、行内纠偏气泡，以及 Markdown 渲染的 Codex 最终答复。
+- **心跳与上下文水位条**：实时展示执行阶段（思考中/执行命令/输出中）、耗时与心跳 `idleMs`，并在 Token 占用达到 `>= 80%` 时显示黄色告警与快捷**「立即压缩」**按钮。
+- **UI 直接控场**：看 Codex 跑偏时可直接在底部发送纠偏指令（`Steer`）或**强停任务**（不抢占 Gemini 对后台回执的认领权）；闲置持久会话可一键执行**压缩上下文**、**分叉会话（Fork）**、**归档关闭**或**清理历史**。
+- **Antigravity 原生联动**：点击 Diff 中受影响的工作区文件可直接在侧边栏打开源码（`com.google.antigravity/toggle-aux-pane`），也可按当前宿主能力一键将 Codex 结论**引用或发回 Gemini**；界面自动适配深浅色主题与中英文环境。
 
 ## 配置说明（`mcp_config.json` `env`）
 
@@ -65,17 +75,20 @@
 | `CODEX_WRAPPER_PATH` | 自动探测 | 可选显式指定 `@openai/codex/bin/codex.js` 路径；未设置时按顺序自动探测本地 `node_modules`、标准全局 npm 目录以及可选 DSH 配置目录。 |
 | `CODEX_ANCHOR_PATH` | 未设置 | 解析 `@openai/codex` 依赖时的可选附加搜索目录。 |
 | `CODEX_HOME` | 未设置 | 可选覆盖 Codex CLI 的主目录。 |
+| `CODEX_MONITOR_HTML` | `<plugin>/ui/dist/monitor.html` | 可选指定 MCP App 监控面板 HTML 路径（每次 `resources/read` 实时读取，便于本地开发调试 UI）。 |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | 未设置（继承宿主环境） | 可选代理环境变量，会透传给启动的 `codex app-server` 子进程。 |
 
 ## 架构概览
 
-- `mcp/server.mjs`：MCP stdio JSON-RPC 服务入口、工具 Schema 定义、后台任务调度、遥测聚合与温池协调。
-- `mcp/codex-wire.mjs`：`@openai/codex app-server --stdio` JSON-RPC v2 帧解析、流式增量心跳、`plan`/`diff` 节流合并及线程/轮次 RPC 封装。
+- `mcp/server.mjs`：MCP stdio JSON-RPC 服务入口、MCP App 资源与视图入口注册（`ui://`）、工具 Schema 定义、后台任务调度、遥测聚合与温池协调。
+- `mcp/codex-wire.mjs`：`@openai/codex app-server --stdio` JSON-RPC v2 帧解析、流式增量心跳、仅供 UI 消费的增量/Diff/操作明细事件、`plan`/`diff` 节流合并及线程/轮次 RPC 封装。
 - `mcp/codex-client.mjs`：子进程生命周期管理、`@openai/codex` 路径解析、线程配置校验、rollout JSONL 完整性核验、温池、`compact` 与 `fork` 实现。
 - `mcp/session-store.mjs`：带独占 `.lock` 保护的持久化会话注册表、`uncertain` 状态协调与原子 `fork`/租约事务。
 - `mcp/disk-job-store.mjs`：按 store 隔离的磁盘任务回执存储及跨 MCP 重启的原子单次认领恢复。
+- `mcp/transcript-store.mjs`：按 store 隔离的 UI 对话记录存储（`data/transcripts/`）、单调递增 `afterSeq` 增量拉取合并以及敏感凭据正则脱敏（`redactSecrets`）。
 - `mcp/local-path-guard.mjs`：路径、重解析点、UNC/设备命名空间、网络驱动器防护与本地多模态图片校验。
 - `mcp/subprocess-adapter.mjs`：跨平台子进程启动、管道排空与进程树终止适配（Windows 下使用 `taskkill /T /F`）。
+- `ui/`：基于 `@modelcontextprotocol/ext-apps` 构建的 MCP App 前端源码，经 `esbuild` 打包为单文件 `ui/dist/monitor.html`（运行时零第三方 npm 依赖）。
 
 ## 测试
 
@@ -83,6 +96,12 @@
 
 ```bash
 npm run test:unit
+```
+
+如需修改 `ui/src/` 下前端代码并重新打包单文件 `ui/dist/monitor.html`（需先执行 `npm install` 安装 `devDependencies`）：
+
+```bash
+npm run build:ui
 ```
 
 运行完整自动化测试套件（包含真实 `@openai/codex` 端到端测试，需要本机已认证的 `@openai/codex` 与可用网络）：

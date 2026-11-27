@@ -1,6 +1,6 @@
 {
   "name": "antigravity-codex-subagent",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "license": "MIT",
   "description": "Persistent Codex subagent MCP server plugin for Antigravity over the official @openai/codex app-server protocol",
@@ -23,7 +23,12 @@
     "node": ">=20.0.0"
   },
   "scripts": {
+    "build:ui": "node scripts/build-ui.mjs",
     "test": "node test/run-all.mjs",
     "test:unit": "node test/run-all.mjs --unit-only"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "esbuild": "^0.28.2"
   }
 }

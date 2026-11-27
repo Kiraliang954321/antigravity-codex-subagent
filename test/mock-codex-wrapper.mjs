@@ -300,7 +300,7 @@ async function handleRequest(msg) {
       threadId: meta.id,
       turn: { id: turnId, status: 'inProgress', items: [] },
     });
-    await sleep(120);
+    await sleep(Number(process.env.MOCK_CODEX_COMPACT_DELAY_MS ?? 120));
     const omitNotification = process.env.MOCK_CODEX_OMIT_COMPACT_PROOF === '1' || process.env.MOCK_CODEX_COMPACT_STALE_NOTIFY === '1';
     const omitRolloutCompaction = process.env.MOCK_CODEX_OMIT_COMPACT_PROOF === '1' || process.env.MOCK_CODEX_OMIT_COMPACT_ROLLOUT === '1';
     if (process.env.MOCK_CODEX_COMPACT_STALE_NOTIFY === '1') {
@@ -405,6 +405,14 @@ async function handleRequest(msg) {
     };
     activeTurns.set(turnId, turnState);
 
+    if (directive.mode === 'ui_stream') {
+      sendNotification('item/reasoning/summaryTextDelta', {
+        threadId: meta.id, turnId, itemId: 'ui-reasoning', delta: 'SECRET_THOUGHT_DELTA tokens=80000/100000; ',
+      });
+      sendNotification('item/reasoning/textDelta', {
+        threadId: meta.id, turnId, itemId: 'ui-reasoning', delta: 'sk-',
+      });
+    }
     sendResult(id, { turn: { id: turnId, status: 'inProgress', items: [] } });
     sendNotification('turn/started', {
       threadId: meta.id,
@@ -420,6 +428,31 @@ async function handleRequest(msg) {
         turnState.resolveSteer = resolve;
         setTimeout(resolve, directive.maxWaitMs ?? 8000);
       });
+      if (directive.afterSteerDelayMs) await sleep(directive.afterSteerDelayMs);
+    } else if (directive.mode === 'ui_stream') {
+      const scope = { threadId: meta.id, turnId };
+      sendNotification('item/started', {
+        ...scope, item: { type: 'commandExecution', id: 'ui-command', command: ['echo', 'Bearer', 'abcdefgh12345678'], status: 'inProgress' },
+      });
+      sendNotification('item/commandExecution/outputDelta', { ...scope, itemId: 'ui-command', delta: 'SECRET_CMD_DELTA_LINE' });
+      sendNotification('item/completed', {
+        ...scope, item: { type: 'commandExecution', id: 'ui-command', status: 'completed', exitCode: 0, aggregatedOutput: 'NOT_ACTIVITY_SUMMARY' },
+      });
+      sendNotification('item/agentMessage/delta', { ...scope, itemId: 'ui-message', delta: 'Monitor-only agent delta' });
+      sendNotification('turn/plan/updated', {
+        ...scope, explanation: 'Inspect tokens and credentials', plan: [{ step: 'Review file', status: 'inProgress' }],
+      });
+      const diff = 'diff --git a/inside.txt b/inside.txt\n+++ b/inside.txt\n+SECRET_DIFF_BODY\n'
+        + '+++ b/../outside.txt\n+++ b/escape/outside.txt\n+++ b/inside.txt:stream\n+++ //not-local/share.txt\n';
+      sendNotification('turn/diff/updated', { ...scope, diff });
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(path.join(stateDir, 'continue-ui-stream')) && Date.now() < deadline) await sleep(25);
+      sendNotification('item/reasoning/textDelta', {
+        ...scope, itemId: 'ui-reasoning', delta: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ Bearer abcdefgh12345678 complete',
+      });
+      for (let index = 0; index < (directive.bulkDiffs ?? 0); index += 1) {
+        sendNotification('turn/diff/updated', { ...scope, diff: `${diff}${'多'.repeat(32000)}` });
+      }
     } else if (directive.mode === 'stream_plan_diff') {
       await sleep(300);
       sendNotification('item/reasoning/summaryTextDelta', {

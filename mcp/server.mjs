@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CODEX_PERMISSION_MODES,
   CODEX_SANDBOX_MODES,
@@ -21,7 +22,9 @@ import {
 import { createDiskJobStore, resolveIsolatedJobsDir } from './disk-job-store.mjs';
 import {
   assertUsableCwd,
+  isUncOrDevicePath,
   resolveAccessibleCwd,
+  resolveLocalPathWithoutRemoteTraversal,
   validateLocalImages,
 } from './local-path-guard.mjs';
 import {
@@ -34,11 +37,16 @@ import {
   validateThreadId,
 } from './session-store.mjs';
 import { spawnSubprocess } from './subprocess-adapter.mjs';
+import { canonicalConversationId, createTranscriptStore, redactSecrets, resolveIsolatedTranscriptsDir } from './transcript-store.mjs';
 
 const SERVER_NAME = 'codex-subagent';
-const SERVER_VERSION = '0.4.0';
+const SERVER_VERSION = '0.5.0';
 const DEFAULT_MODEL = undefined;
 const PROTOCOL_FALLBACK_VERSION = '2024-11-05';
+const MONITOR_RESOURCE_URI = 'ui://codex-subagent/monitor.html';
+const MONITOR_RESOURCE_MIME = 'text/html;profile=mcp-app';
+const MAX_MONITOR_HTML_BYTES = 10 * 1024 * 1024;
+const MAX_UI_RESPONSE_BYTES = 512 * 1024;
 
 const DEFAULT_WAIT_MS = 120_000;
 const MIN_WAIT_MS = 1_000;
@@ -206,6 +214,113 @@ const LIST_SESSIONS_TOOL = Object.freeze({
     properties: {},
   },
 });
+
+const MONITOR_RESOURCE = {
+  uri: MONITOR_RESOURCE_URI,
+  name: 'Codex Subagent Monitor',
+  description: 'Live Gemini <-> Codex monitor and interactive control panel.',
+  mimeType: MONITOR_RESOURCE_MIME,
+  _meta: { ui: { prefersBorder: false } },
+};
+
+const UI_STRING = { type: 'string', minLength: 1 };
+const SUBAGENT_CODEX_MONITOR_TOOL = {
+  name: 'subagent_codex_monitor',
+  description: 'Open the Codex Subagent Monitor, optionally focused on a conversation, session, or job.',
+  inputSchema: {
+    type: 'object', additionalProperties: false,
+    properties: { conversationId: UI_STRING, sessionKey: UI_STRING, jobId: UI_STRING },
+  },
+  _meta: {
+    ui: { resourceUri: MONITOR_RESOURCE_URI },
+    'com.google.antigravity/ui': {
+      entrypoints: [{ type: 'aux_pane', title: 'Codex Monitor' }, { type: 'global', title: 'Codex Subagent' }],
+    },
+  },
+};
+
+function appTool(name, description, properties, required = []) {
+  return {
+    name, description,
+    inputSchema: { type: 'object', additionalProperties: false, properties, required },
+    _meta: { ui: { visibility: ['app'] } },
+  };
+}
+
+const MONITOR_APP_TOOLS = [
+  appTool('codex_ui_list_conversations', 'List monitor conversations and active jobs.', {}),
+  appTool('codex_ui_get_conversation', 'Poll monitor events for a conversation.', {
+    conversationId: UI_STRING,
+    afterSeq: { type: 'integer', minimum: 0 },
+    limit: { type: 'integer', minimum: 1, maximum: 400 },
+  }, ['conversationId']),
+  appTool('codex_ui_steer', 'Steer an active Codex turn without waiting for it to finish.', {
+    jobId: UI_STRING, steer: UI_STRING,
+  }, ['jobId', 'steer']),
+  appTool('codex_ui_action', 'Manage a monitor job, owned session, or its history.', {
+    action: { type: 'string', enum: ['cancel', 'compact', 'fork', 'close', 'clear_history'] },
+    jobId: UI_STRING, sessionKey: UI_STRING, threadId: UI_STRING, targetSessionKey: UI_STRING, conversationId: UI_STRING,
+  }, ['action']),
+];
+
+function uiResult(structuredContent, text = JSON.stringify(structuredContent), isError = false) {
+  return { content: [{ type: 'text', text }], structuredContent, ...(isError ? { isError: true } : {}) };
+}
+
+function validateMonitorArgs(args, { name, inputSchema }) {
+  if (!isPlainObject(args)) throw new Error(`${name}: arguments must be an object`);
+  for (const key of inputSchema.required ?? []) {
+    if (!Object.hasOwn(args, key)) throw new Error(`${name}: ${key} is required`);
+  }
+  for (const [key, value] of Object.entries(args)) {
+    if (!Object.hasOwn(inputSchema.properties, key)) throw new Error(`${name}: unknown argument "${key}"`);
+    const schema = inputSchema.properties[key];
+    if ((schema.type === 'string' && (typeof value !== 'string' || !value.trim()))
+      || (schema.type === 'integer' && (!Number.isSafeInteger(value) || value < schema.minimum || value > (schema.maximum ?? Infinity)))
+      || (schema.enum && !schema.enum.includes(value))) throw new Error(`${name}: invalid ${key}`);
+  }
+}
+
+function isInsideDirectory(directory, candidate) {
+  const relative = path.relative(directory, candidate);
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function safeFileLinkResolver(cwd) {
+  const cache = new Map();
+  if (!cwd || !path.isAbsolute(cwd) || isUncOrDevicePath(cwd) || /^[\\/]{2}/.test(cwd)) return () => null;
+  const requestCache = new Map();
+  const resolveLocal = (candidate) => {
+    if (process.platform === 'win32' && candidate.slice(2).includes(':')) throw new Error('Invalid file path');
+    const safePath = resolveLocalPathWithoutRemoteTraversal(candidate, 'monitor path', { requestCache });
+    const realPath = realpathSync.native(safePath);
+    if (isUncOrDevicePath(realPath)) throw new Error('Invalid real path');
+    return realPath;
+  };
+  let realCwd;
+  try {
+    realCwd = resolveLocal(cwd);
+    if (!statSync(realCwd).isDirectory()) return () => null;
+  } catch { return () => null; }
+  return (file) => {
+    if (cache.has(file)) return cache.get(file);
+    let link = null;
+    if (typeof file === 'string' && file && !isUncOrDevicePath(file) && !/^[\\/]{2}/.test(file)
+      && !(process.platform === 'win32' && (/^[A-Za-z]:(?![\\/])/.test(file) || /^[\\/]/.test(file)))) {
+      try {
+        const candidate = path.resolve(cwd, file);
+        if (isInsideDirectory(cwd, candidate)) {
+          const realFile = resolveLocal(candidate);
+          if (isInsideDirectory(realCwd, realFile) && statSync(realFile).isFile()) {
+            link = { path: file, uri: pathToFileURL(realFile).href };
+          }
+        }
+      } catch {}
+    }
+    cache.set(file, link);
+    return link;
+  };
+}
 
 function logError(message) {
   process.stderr.write(`[${SERVER_NAME}] ${message}\n`);
@@ -836,6 +951,7 @@ async function main() {
     logError,
   });
   diskJobs.sweep();
+  const transcriptStore = createTranscriptStore(resolveIsolatedTranscriptsDir(config.storePath), { logError });
 
   const warmPool = createWarmCodexPool({
     idleMs: config.warmIdleMs,
@@ -905,6 +1021,79 @@ async function main() {
   let shuttingDown = false;
   let shutdownPromise;
 
+  const protectedConversations = () => [...jobs.values()].filter((job) => !job.settled).map((job) => job.conversationId);
+
+  const ensureJobConversation = (job) => transcriptStore.ensureConversation(job.conversationId, {
+    title: job.description, sessionKey: job.conversationSessionKey ?? null, threadId: job.threadId ?? null,
+    cwd: job.cwd, model: job.model, status: 'running',
+  }, protectedConversations());
+
+  const recordJobEvent = (job, event) => {
+    if (!transcriptStore.hasConversation(job.conversationId)) ensureJobConversation(job);
+    transcriptStore.appendEvent(job.conversationId, { jobId: job.id, turnId: job.turnId, ...event });
+  };
+
+  const recordDelegation = (job, validated) => {
+    ensureJobConversation(job);
+    transcriptStore.updateMeta(job.conversationId, {
+      status: 'running', threadId: job.threadId, model: job.model,
+    });
+    recordJobEvent(job, {
+      type: 'delegation',
+      action: validated.action,
+      description: job.description,
+      prompt: validated.prompt,
+      ...(validated.sandbox ? { sandbox: validated.sandbox } : {}),
+      ...(validated.permissionMode ? { permissionMode: validated.permissionMode } : {}),
+      ...(validated.reasoningEffort ? { reasoningEffort: validated.reasoningEffort } : {}),
+      ...(job.model ? { model: job.model } : {}),
+      ...(Array.isArray(validated.images) && validated.images.length > 0 ? { imageCount: validated.images.length } : {}),
+      ...(validated.outputSchema ? { hasOutputSchema: true } : {}),
+    });
+  };
+
+  const recordDiagnostic = (job, event) => {
+    recordJobTelemetry(job, event);
+    const id = job.conversationId;
+    const { threadId, turnId, itemId } = event;
+    switch (event.type) {
+      case 'turnStarted': {
+        if (job.transcriptTurnId === turnId) break;
+        job.transcriptTurnId = turnId;
+        const conversation = ensureJobConversation(job);
+        transcriptStore.updateMeta(id, { threadId, turnCount: conversation.turnCount + 1 });
+        break;
+      }
+      case 'streamDelta':
+        if (!transcriptStore.hasConversation(id)) ensureJobConversation(job);
+        transcriptStore.upsertStreamEvent(id, { jobId: job.id, turnId, channel: event.channel, itemId, delta: event.delta });
+        break;
+      case 'planUpdated': {
+        const plan = { explanation: event.explanation, steps: event.steps };
+        transcriptStore.updateMeta(id, { latestPlan: plan });
+        recordJobEvent(job, { type: 'plan', turnId, ...plan });
+        break;
+      }
+      case 'diffUpdated':
+        transcriptStore.updateMeta(id, { latestDiffSummary: { filesChangedCount: event.filesChangedCount, files: event.files } });
+        break;
+      case 'diffDetail': {
+        const summary = { filesChangedCount: event.filesChangedCount, files: event.files };
+        transcriptStore.updateMeta(id, { latestDiffSummary: summary });
+        recordJobEvent(job, { type: 'diff', turnId, ...summary, diff: event.diff, truncated: event.truncated });
+        break;
+      }
+      case 'activityDetail':
+        recordJobEvent(job, { type: 'activity', turnId, itemId, kind: event.kind, phase: event.phase, summary: event.summary });
+        break;
+      case 'tokenUsage':
+        if (job.tokenUsage) transcriptStore.updateMeta(id, { tokenUsage: job.tokenUsage });
+        break;
+      default:
+        break;
+    }
+  };
+
   const trackOp = (promise) => {
     inFlightOps.add(promise);
     const cleanup = () => inFlightOps.delete(promise);
@@ -937,11 +1126,12 @@ async function main() {
 
   const persistJobReceiptIfUnclaimed = (job) => {
     if (job.persistedToDisk) return true;
-    if (!job.settled || job.claimed || !job.publishedRunning) return true;
+    if (!job.settled || job.claimed || job.uiOwned || !job.publishedRunning) return true;
     const settledAt = job.settledAt ?? Date.now();
     const ok = diskJobs.writeJob({
       version: 1,
       jobId: job.id,
+      conversationId: job.conversationId,
       startedAt: job.startedAt,
       settledAt,
       expiresAt: settledAt + JOB_TTL_MS,
@@ -1074,13 +1264,21 @@ async function main() {
     };
   };
 
-  const createJobRecord = (validated) => {
+  const createJobRecord = (validated, uiOwned = false) => {
     const jobId = randomUUID();
     const jobController = new AbortController();
     const nowMs = Date.now();
     const nowMono = performance.now();
+    const owned = store.list().find((row) => row.threadId === validated.threadId
+      && path.relative(row.cwd, validated.cwd) === '');
+    const conversationSessionKey = validated.sessionKey ?? owned?.sessionKey;
     return {
       id: jobId,
+      conversationId: canonicalConversationId({ sessionKey: conversationSessionKey, threadId: validated.threadId, jobId }),
+      conversationSessionKey,
+      model: validated.explicitModel ?? owned?.model ?? config.model ?? null,
+      action: validated.action,
+      uiOwned,
       description: validated.description,
       sessionKey: validated.sessionKey,
       threadId: validated.threadId,
@@ -1109,6 +1307,17 @@ async function main() {
     };
   };
 
+  const recordJobCompletion = (job) => {
+    ensureJobConversation(job);
+    const text = formatTextOutput(job.result.content);
+    const row = store.list().find((entry) => entry.threadId === job.threadId);
+    const status = row?.state ?? (job.controller.signal.aborted ? 'cancelled' : job.result.isError ? 'failed' : 'completed');
+    transcriptStore.updateMeta(job.conversationId, {
+      status, threadId: job.threadId, model: row?.model ?? job.model, lastPreview: redactSecrets(text).slice(0, 2000),
+    });
+    recordJobEvent(job, { type: job.action === 'compact' ? 'compact' : 'answer', text, isError: Boolean(job.result.isError) });
+  };
+
   const attachJobCompletion = (job, runPromise) => {
     job.done = runPromise.then((finalResult) => {
       job.settled = true;
@@ -1116,6 +1325,7 @@ async function main() {
       job.result = finalResult;
       job.activeActivities.clear();
       job.activeRun = null;
+      recordJobCompletion(job);
       persistJobReceiptIfUnclaimed(job);
       if (jobs.has(job.id) && !job.claimed && job.expiryTimer === undefined) {
         job.expiryTimer = setTimeout(() => {
@@ -1133,6 +1343,7 @@ async function main() {
   const startBackgroundCodexJob = (validated) => {
     const job = createJobRecord(validated);
     const jobController = job.controller;
+    recordDelegation(job, validated);
 
     const runPromise = (async () => {
       const hasSelector = validated.sessionKey !== undefined || validated.threadId !== undefined;
@@ -1209,9 +1420,10 @@ async function main() {
               lease,
               onThreadKnown: (knownId) => {
                 job.threadId = knownId;
+                transcriptStore.updateMeta(job.conversationId, { threadId: knownId });
               },
               onDiagnostic: (event) => {
-                recordJobTelemetry(job, event);
+                recordDiagnostic(job, event);
               },
               onError: (err, stopReason) => {
                 logError(`child run failed (${stopReason}): ${err?.message ?? err}`);
@@ -1281,9 +1493,10 @@ async function main() {
     return attachJobCompletion(job, runPromise);
   };
 
-  const startBackgroundCompactJob = (validated) => {
-    const job = createJobRecord(validated);
+  const startBackgroundCompactJob = (validated, uiOwned = false) => {
+    const job = createJobRecord(validated, uiOwned);
     const jobController = job.controller;
+    recordDelegation(job, validated);
 
     const runPromise = (async () => {
       let lease;
@@ -1344,7 +1557,7 @@ async function main() {
             turnTimeoutMs: config.turnTimeoutMs,
             lease,
             onDiagnostic: (event) => {
-              recordJobTelemetry(job, event);
+              recordDiagnostic(job, event);
             },
             onError: (err, stopReason) => {
               logError(`compact run failed (${stopReason}): ${err?.message ?? err}`);
@@ -1402,6 +1615,80 @@ async function main() {
     return attachJobCompletion(job, runPromise);
   };
 
+  const closeOwnedThread = (selector, requestSignal) => trackOp((async () => {
+    const ownedRow = await store.getOwnedThread(selector);
+    if (!ownedRow) {
+      throw new CodexSessionError(CODEX_ERROR_CODES.NOT_FOUND, 'subagent-codex: target thread was not found in the session store');
+    }
+    if (ownedRow.active) {
+      throw new CodexSessionError(CODEX_ERROR_CODES.BUSY, `subagent-codex: thread "${ownedRow.threadId}" has an active run and cannot be closed`);
+    }
+    const receipt = await store.close(selector, makeArchiveFn(selector.cwd, requestSignal));
+    const id = canonicalConversationId(receipt);
+    transcriptStore.ensureConversation(id, { ...ownedRow, title: ownedRow.sessionKey ?? ownedRow.threadId }, protectedConversations());
+    transcriptStore.updateMeta(id, { status: 'closed' });
+    transcriptStore.appendEvent(id, { type: 'closed', threadId: receipt.threadId });
+    return receipt;
+  })());
+
+  const forkOwnedThread = (validated, requestSignal) => trackOp((async () => {
+    const lease = await store.acquireFork(
+      {
+        sourceSessionKey: validated.sessionKey,
+        sourceThreadId: validated.threadId,
+        targetSessionKey: validated.targetSessionKey,
+        cwd: validated.cwd,
+        model: validated.explicitModel,
+        defaultModel: config.model,
+        reconcileUncertain: makeUncertainReconcileFn(),
+        prune: (pruneOpts) =>
+          store.prune({
+            archive: makeArchiveFn(validated.cwd, requestSignal),
+            reconcileClosing: makeReadReconcileFn(),
+            reconcileUncertain: makeUncertainReconcileFn(),
+            ...pruneOpts,
+          }),
+      },
+      requestSignal,
+    );
+    try {
+      await warmPool.evict(lease.sourceThreadId);
+      const receipt = await forkCodexThread({
+        spawn: spawnSubprocess,
+        wrapperPath: config.wrapperPath,
+        codexAnchorPath: config.codexAnchorPath,
+        sourceThreadId: lease.sourceThreadId,
+        lastTurnId: validated.lastTurnId,
+        cwd: validated.cwd,
+        permissionMode: validated.permissionMode,
+        sandbox: validated.sandbox,
+        explicitModel: validated.explicitModel,
+        model: config.model,
+        config:
+          validated.reasoningEffort !== undefined
+            ? { model_reasoning_effort: validated.reasoningEffort }
+            : undefined,
+        env: config.childEnv,
+        eofGraceMs: config.eofGraceMs,
+        disposeGraceMs: config.disposeGraceMs,
+        signal: requestSignal,
+        codexHome: config.codexHome,
+        requestTimeoutMs: config.requestTimeoutMs,
+        lease,
+      });
+      const row = store.list().find((entry) => entry.threadId === receipt.threadId);
+      const id = canonicalConversationId({ sessionKey: validated.targetSessionKey });
+      const meta = { ...row, sessionKey: validated.targetSessionKey, threadId: receipt.threadId, cwd: validated.cwd, status: 'ready' };
+      transcriptStore.ensureConversation(id, { ...meta, title: validated.targetSessionKey }, protectedConversations());
+      transcriptStore.updateMeta(id, meta);
+      transcriptStore.appendEvent(id, { type: 'fork', threadId: receipt.threadId, sourceThreadId: lease.sourceThreadId });
+      return receipt;
+    } catch (error) {
+      lease.release?.();
+      throw error;
+    }
+  })());
+
   const handleSubagentCodex = async (rawArgs, requestSignal, progressToken) => {
     const validated = validateSubagentArgs(rawArgs, {
       model: config.model,
@@ -1412,101 +1699,14 @@ async function main() {
     });
 
     if (validated.action === 'close') {
-      const closeOp = (async () => {
-        const ownedRow = await store.getOwnedThread({
-          sessionKey: validated.sessionKey,
-          threadId: validated.threadId,
-          cwd: validated.cwd,
-        });
-        if (!ownedRow) {
-          throw new CodexSessionError(
-            CODEX_ERROR_CODES.NOT_FOUND,
-            'subagent-codex: target thread was not found in the session store',
-          );
-        }
-        if (ownedRow.active) {
-          throw new CodexSessionError(
-            CODEX_ERROR_CODES.BUSY,
-            `subagent-codex: thread "${ownedRow.threadId}" has an active run and cannot be closed`,
-          );
-        }
-
-        const receipt = await store.close(
-          {
-            sessionKey: validated.sessionKey,
-            threadId: validated.threadId,
-            cwd: validated.cwd,
-          },
-          makeArchiveFn(validated.cwd, requestSignal),
-        );
-
-        return {
-          content: [{ type: 'text', text: JSON.stringify(receipt, null, 2) }],
-        };
-      })();
-      return await trackOp(closeOp);
+      const { sessionKey, threadId, cwd } = validated;
+      const receipt = await closeOwnedThread({ sessionKey, threadId, cwd }, requestSignal);
+      return { content: [{ type: 'text', text: JSON.stringify(receipt, null, 2) }] };
     }
 
     if (validated.action === 'fork') {
-      const forkOp = (async () => {
-        const lease = await store.acquireFork(
-          {
-            sourceSessionKey: validated.sessionKey,
-            sourceThreadId: validated.threadId,
-            targetSessionKey: validated.targetSessionKey,
-            cwd: validated.cwd,
-            model: validated.explicitModel,
-            defaultModel: config.model,
-            reconcileUncertain: makeUncertainReconcileFn(),
-            prune: (pruneOpts) =>
-              store.prune({
-                archive: makeArchiveFn(validated.cwd, requestSignal),
-                reconcileClosing: makeReadReconcileFn(),
-                reconcileUncertain: makeUncertainReconcileFn(),
-                ...pruneOpts,
-              }),
-          },
-          requestSignal,
-        );
-        try {
-          await warmPool.evict(lease.sourceThreadId);
-          const receipt = await forkCodexThread({
-            spawn: spawnSubprocess,
-            wrapperPath: config.wrapperPath,
-            codexAnchorPath: config.codexAnchorPath,
-            sourceThreadId: lease.sourceThreadId,
-            lastTurnId: validated.lastTurnId,
-            cwd: validated.cwd,
-            permissionMode: validated.permissionMode,
-            sandbox: validated.sandbox,
-            explicitModel: validated.explicitModel,
-            model: config.model,
-            config:
-              validated.reasoningEffort !== undefined
-                ? { model_reasoning_effort: validated.reasoningEffort }
-                : undefined,
-            env: config.childEnv,
-            eofGraceMs: config.eofGraceMs,
-            disposeGraceMs: config.disposeGraceMs,
-            signal: requestSignal,
-            codexHome: config.codexHome,
-            requestTimeoutMs: config.requestTimeoutMs,
-            lease,
-          });
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `${JSON.stringify(receipt, null, 2)}\n\n[codex-thread threadId=${receipt.threadId} resumed=false]`,
-              },
-            ],
-          };
-        } catch (error) {
-          lease.release?.();
-          throw error;
-        }
-      })();
-      return await trackOp(forkOp);
+      const receipt = await forkOwnedThread(validated, requestSignal);
+      return { content: [{ type: 'text', text: `${JSON.stringify(receipt, null, 2)}\n\n[codex-thread threadId=${receipt.threadId} resumed=false]` }] };
     }
 
     const job =
@@ -1561,9 +1761,18 @@ async function main() {
         };
       }
 
+      const diskJob = validated.cancel
+        ? diskJobs.listUnclaimed(new Set(), { includeConversationId: true }).find((entry) => entry.jobId === validated.jobId)
+        : undefined;
       const diskResult = diskJobs.claimJobFromDisk(validated.jobId);
       if (diskResult) {
         if (validated.cancel) {
+          if (diskJob) {
+            const conversationId = conversationIdForDiskJob(diskJob, store.list());
+            if (transcriptStore.hasConversation(conversationId)) {
+              transcriptStore.appendEvent(conversationId, { type: 'cancel', source: 'model', jobId: validated.jobId });
+            }
+          }
           return {
             content: [
               {
@@ -1584,6 +1793,7 @@ async function main() {
     if (validated.cancel) {
       job.controller.abort(new Error('Cancelled via subagent_codex_wait'));
       await Promise.race([job.done, delay(5_000).catch(() => {})]);
+      recordJobEvent(job, { type: 'cancel', source: 'model' });
       claimJob(job);
       return {
         content: [
@@ -1618,7 +1828,8 @@ async function main() {
         { type: 'text', text: validated.steer },
         ...steerImages.map((imagePath) => ({ type: 'localImage', path: imagePath })),
       ];
-      await job.activeRun.steer(steerBlocks, { signal: requestSignal });
+      const receipt = await job.activeRun.steer(steerBlocks, { signal: requestSignal });
+      recordJobEvent(job, { type: 'steer', turnId: receipt.turnId, source: 'model', text: validated.steer });
     }
 
     const detachProgress = attachProgressListener(job, progressToken);
@@ -1673,6 +1884,210 @@ async function main() {
     };
   };
 
+  const conversationIdForDiskJob = (job, rows) => job.conversationId ?? canonicalConversationId({
+    sessionKey: job.sessionKey ?? rows.find((row) => row.threadId === job.threadId)?.sessionKey,
+    threadId: job.threadId, jobId: job.jobId,
+  });
+
+  const monitorStatusRank = (status) => {
+    if (status === 'running') return 0;
+    if (status === 'completed_unclaimed') return 1;
+    if (status === 'ready' || status === 'uncertain') return 2;
+    return 3;
+  };
+
+  const monitorInventory = () => {
+    const rows = store.list();
+    const conversations = new Map(transcriptStore.listConversations().map((conv) => [conv.conversationId, conv]));
+    const latestJobs = new Map();
+    const disk = diskJobs.listUnclaimed(new Set(jobs.keys()), { includeConversationId: true });
+    const merge = (id, meta) => {
+      const existing = conversations.get(id);
+      const updatedAt = existing?.updatedAt && existing.updatedAt > meta.updatedAt ? existing.updatedAt : meta.updatedAt;
+      conversations.set(id, {
+        version: 1, conversationId: id, kind: id.startsWith('ephemeral:') ? 'ephemeral' : 'session',
+        model: null, turnCount: 0, tokenUsage: null, latestPlan: null, latestDiffSummary: null, lastPreview: null, nextSeq: 0,
+        createdAt: meta.updatedAt, ...existing, ...meta, updatedAt,
+      });
+    };
+    for (const [id, conv] of conversations) {
+      if (conv.status === 'running') conversations.set(id, { ...conv, status: 'interrupted' });
+    }
+    for (const row of rows) {
+      const id = canonicalConversationId(row);
+      const tokenUsage = !conversations.get(id)?.tokenUsage && typeof row.used === 'number'
+        ? {
+            totalTokens: row.used,
+            modelContextWindow: typeof row.contextWindow === 'number' ? row.contextWindow : null,
+            utilizationPct: typeof row.contextWindow === 'number' && row.contextWindow > 0
+              ? Math.floor((row.used / row.contextWindow) * 1000 + 1e-9) / 10
+              : null,
+          }
+        : undefined;
+      merge(id, {
+        title: conversations.get(id)?.title ?? redactSecrets(row.sessionKey ?? row.threadId),
+        sessionKey: row.sessionKey ?? null, threadId: row.threadId, cwd: row.cwd,
+        model: row.model ? redactSecrets(row.model) : null, status: row.active ? 'running' : row.state,
+        ...(tokenUsage ? { tokenUsage } : {}),
+        updatedAt: row.lastUsedAt,
+      });
+    }
+    const mergeJob = (id, job, status, updatedAt) => {
+      const existing = conversations.get(id);
+      const chosen = latestJobs.get(id);
+      if (chosen && (monitorStatusRank(chosen.status) < monitorStatusRank(status)
+        || (chosen.status === status && chosen.updatedAt > updatedAt))) return;
+      latestJobs.set(id, { jobId: job.id ?? job.jobId, status, updatedAt });
+      merge(id, {
+        title: existing?.title ?? redactSecrets(job.description || id),
+        sessionKey: job.conversationSessionKey ?? job.sessionKey ?? existing?.sessionKey ?? null,
+        threadId: job.threadId ?? existing?.threadId ?? null, cwd: job.cwd, updatedAt,
+        status: existing?.status === 'running' && status !== 'running' ? 'running' : status,
+        jobId: job.id ?? job.jobId,
+      });
+    };
+    for (const job of disk) {
+      const id = conversationIdForDiskJob(job, rows);
+      mergeJob(id, job, job.status, job.settledAt ?? job.expiresAt);
+    }
+    for (const job of jobs.values()) {
+      mergeJob(job.conversationId, job, job.settled ? 'completed_unclaimed' : 'running', new Date(job.settledAt ?? job.startedAt).toISOString());
+    }
+    return { conversations, latestJobs, rows, disk };
+  };
+
+  const handleMonitorOpen = ({ conversationId, sessionKey, jobId }) => {
+    const { conversations, rows, disk } = monitorInventory();
+    const diskJob = jobId && disk.find((job) => job.jobId === jobId);
+    const initialConversationId = conversationId ?? (sessionKey ? canonicalConversationId({ sessionKey }) : undefined)
+      ?? (jobId ? jobs.get(jobId)?.conversationId : undefined)
+      ?? (diskJob ? conversationIdForDiskJob(diskJob, rows) : null);
+    return uiResult({ serverVersion: SERVER_VERSION, initialConversationId, counts: {
+      running: [...jobs.values()].filter((job) => !job.settled).length, sessions: rows.length, total: conversations.size,
+    } }, 'Codex Subagent Monitor');
+  };
+
+  const handleMonitorList = () => {
+    const conversations = [...monitorInventory().conversations.values()].sort((left, right) =>
+      monitorStatusRank(left.status) - monitorStatusRank(right.status) || Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+    return uiResult({ conversations, serverVersion: SERVER_VERSION, now: new Date().toISOString() });
+  };
+
+  const handleMonitorGet = ({ conversationId, afterSeq = 0, limit = 200 }) => {
+    const inventory = monitorInventory();
+    let conversation = inventory.conversations.get(conversationId);
+    if (!conversation) throw new Error('codex_ui_get_conversation: conversation not found');
+    const page = transcriptStore.getConversation(conversationId, { afterSeq, limit });
+    const job = jobs.get(inventory.latestJobs.get(conversationId)?.jobId);
+    let liveJob = job ? {
+      jobId: job.id, description: redactSecrets(job.description), status: job.settled ? 'completed_unclaimed' : 'running',
+      elapsedMs: Math.max(0, (job.settledAt ?? Date.now()) - job.startedAt), startedAt: new Date(job.startedAt).toISOString(),
+      telemetry: snapshotTelemetry(job), steerable: Boolean(typeof job.activeRun?.steer === 'function' && !job.settled),
+    } : null;
+    let events = page?.events ?? [];
+    let truncated = false;
+    let removedEvents = false;
+    let resolveFile;
+    for (;;) {
+      const hasMore = Boolean(page?.hasMore || removedEvents);
+      const payload = {
+        conversation, events, nextSeq: hasMore ? (events.at(-1)?.seq ?? afterSeq) : (page?.nextSeq ?? afterSeq),
+        hasMore, truncated, liveJob, fileLinks: [],
+      };
+      let result = uiResult(payload);
+      if (Buffer.byteLength(JSON.stringify(result), 'utf8') <= MAX_UI_RESPONSE_BYTES) {
+        const files = new Set([
+          ...(conversation.latestDiffSummary?.files ?? []),
+          ...events.flatMap((event) => event.type === 'diff' ? (event.files ?? []) : []),
+        ]);
+        if (files.size > 0) {
+          resolveFile ??= safeFileLinkResolver(conversation.cwd);
+          payload.fileLinks = [...files].map(resolveFile).filter(Boolean);
+          result = uiResult(payload);
+        }
+        if (Buffer.byteLength(JSON.stringify(result), 'utf8') <= MAX_UI_RESPONSE_BYTES) return result;
+      }
+      truncated = true;
+      if (events.length > 1) {
+        events = events.slice(0, Math.ceil(events.length / 2));
+        removedEvents = true;
+      } else if (conversation.latestPlan || conversation.latestDiffSummary) {
+        conversation = { ...conversation, latestPlan: null, latestDiffSummary: null };
+      } else if (events[0] && !events[0].detailOmitted) {
+        const { seq, eventId, at, type, jobId, turnId } = events[0];
+        events = [{ seq, eventId, at, type, jobId, turnId, truncated: true, detailOmitted: true }];
+      } else if (liveJob?.telemetry) {
+        liveJob = { ...liveJob, telemetry: null };
+      } else if (conversation.lastPreview || conversation.title || liveJob?.description) {
+        conversation = { ...conversation, title: '', lastPreview: null };
+        if (liveJob) liveJob = { ...liveJob, description: '' };
+      } else {
+        throw new Error('codex_ui_get_conversation: conversation metadata exceeds response limit');
+      }
+    }
+  };
+
+  const handleMonitorSteer = async ({ jobId, steer }, signal) => {
+    const job = jobs.get(jobId);
+    if (!job || job.settled || typeof job.activeRun?.steer !== 'function') {
+      throw new Error(`codex_ui_steer: job ${jobId} is not in an active steerable turn`);
+    }
+    const { turnId } = await job.activeRun.steer([{ type: 'text', text: steer }], { signal });
+    recordJobEvent(job, { type: 'steer', turnId, source: 'user_ui', text: steer });
+    return uiResult({ ok: true, jobId, turnId });
+  };
+
+  const handleMonitorAction = async ({ action, jobId, sessionKey, threadId, targetSessionKey, conversationId }, signal) => {
+    if (action === 'cancel') {
+      const job = jobId && jobs.get(jobId);
+      if (!job) throw new Error('codex_ui_action: cancel requires an in-memory jobId');
+      job.controller.abort(new Error('Cancelled from Codex Monitor UI'));
+      await Promise.race([job.done, delay(5_000).catch(() => {})]);
+      recordJobEvent(job, { type: 'cancel', source: 'user_ui' });
+      if (job.uiOwned && job.settled) claimJob(job);
+      return uiResult({ ok: true, action, jobId, settled: job.settled });
+    }
+    const rows = store.list();
+    if (action === 'clear_history') {
+      if (!conversationId) throw new Error('codex_ui_action: clear_history requires conversationId');
+      if ([...jobs.values()].some((job) => job.conversationId === conversationId)
+        || diskJobs.listUnclaimed(new Set(), { includeConversationId: true })
+          .some((job) => conversationIdForDiskJob(job, rows) === conversationId)
+        || rows.some((row) => canonicalConversationId(row) === conversationId)) {
+        throw new Error('codex_ui_action: cannot clear history for an open session or a running or unclaimed job');
+      }
+      if (!transcriptStore.deleteConversation(conversationId)) throw new Error('codex_ui_action: could not delete history');
+      return uiResult({ ok: true, action, deleted: true, conversationId });
+    }
+    if (!sessionKey && !threadId) throw new Error(`codex_ui_action: ${action} requires sessionKey or threadId`);
+    const row = rows.find((entry) => (!sessionKey || entry.sessionKey === sessionKey) && (!threadId || entry.threadId === threadId));
+    if (!row) throw new Error('codex_ui_action: owned session not found');
+    if (row.active || row.state === 'closing') throw new Error('codex_ui_action: session already has an active operation');
+    const selector = { sessionKey: row.sessionKey, threadId: row.threadId, cwd: row.cwd };
+    if (action === 'close') {
+      const receipt = await closeOwnedThread(selector, signal);
+      return uiResult({ ok: true, action, closed: true, sessionKey: row.sessionKey ?? null, threadId: receipt.threadId });
+    }
+    const defaults = {
+      ...selector, action, permissionMode: config.permissionMode, sandbox: config.sandbox,
+      reasoningEffort: config.reasoningEffort, waitMs: config.waitMs,
+    };
+    if (action === 'fork') {
+      if (!targetSessionKey) throw new Error('codex_ui_action: fork requires targetSessionKey');
+      validateSessionKey(targetSessionKey);
+      const receipt = await forkOwnedThread({ ...defaults, targetSessionKey }, signal);
+      return uiResult({ ok: true, action, sessionKey: targetSessionKey, threadId: receipt.threadId, sourceThreadId: row.threadId });
+    }
+    const job = startBackgroundCompactJob({ ...defaults, description: 'Compact from Codex Monitor', prompt: '' }, true);
+    job.done.then(() => { if (!job.claimed) claimJob(job); });
+    await Promise.race([job.done, delay(2500)]);
+    if (job.settled && job.result.isError) {
+      return uiResult({ ok: false, action, jobId: job.id, error: redactSecrets(formatTextOutput(job.result.content)) }, undefined, true);
+    }
+    return uiResult({ ok: true, action, status: job.settled ? 'completed' : 'running', jobId: job.id,
+      sessionKey: row.sessionKey ?? null, threadId: row.threadId });
+  };
+
   const handleRequest = async (message) => {
     const { id, method, params } = message;
     const isRequest = id !== undefined && id !== null;
@@ -1698,6 +2113,7 @@ async function main() {
         protocolVersion,
         capabilities: {
           tools: {},
+          resources: {},
         },
         serverInfo: {
           name: SERVER_NAME,
@@ -1712,9 +2128,34 @@ async function main() {
       return;
     }
 
+    if (method === 'resources/list') {
+      sendResult(id, { resources: [MONITOR_RESOURCE] });
+      return;
+    }
+
+    if (method === 'resources/read') {
+      if (params?.uri !== MONITOR_RESOURCE_URI) {
+        sendError(id, -32602, 'Unknown monitor resource URI');
+        return;
+      }
+      try {
+        const monitorPath = process.env.CODEX_MONITOR_HTML?.trim() || path.join(pluginRoot, 'ui', 'dist', 'monitor.html');
+        const file = statSync(monitorPath);
+        if (!file.isFile() || file.size > MAX_MONITOR_HTML_BYTES) throw new Error('Invalid monitor HTML file');
+        const html = readFileSync(monitorPath, 'utf8');
+        if (!html.trim() || Buffer.byteLength(html, 'utf8') > MAX_MONITOR_HTML_BYTES) {
+          throw new Error('Monitor HTML is empty or exceeds the size limit');
+        }
+        sendResult(id, { contents: [{ uri: MONITOR_RESOURCE_URI, mimeType: MONITOR_RESOURCE_MIME, text: html, _meta: MONITOR_RESOURCE._meta }] });
+      } catch {
+        sendError(id, -32603, 'Could not read monitor HTML: missing, empty, or exceeds the size limit');
+      }
+      return;
+    }
+
     if (method === 'tools/list') {
       sendResult(id, {
-        tools: [SUBAGENT_CODEX_TOOL, SUBAGENT_CODEX_WAIT_TOOL, LIST_SESSIONS_TOOL],
+        tools: [SUBAGENT_CODEX_TOOL, SUBAGENT_CODEX_WAIT_TOOL, LIST_SESSIONS_TOOL, SUBAGENT_CODEX_MONITOR_TOOL, ...MONITOR_APP_TOOLS],
       });
       return;
     }
@@ -1743,9 +2184,20 @@ async function main() {
           result = await handleSubagentCodexWait(toolArgs, controller.signal, progressToken);
         } else if (toolName === 'subagent_codex_list_sessions') {
           result = await handleListSessions(toolArgs);
+        } else if (toolName === SUBAGENT_CODEX_MONITOR_TOOL.name) {
+          validateMonitorArgs(toolArgs, SUBAGENT_CODEX_MONITOR_TOOL);
+          result = handleMonitorOpen(toolArgs);
         } else {
-          sendError(id, -32602, `Unknown tool: ${String(toolName)}`);
-          return;
+          const tool = MONITOR_APP_TOOLS.find((entry) => entry.name === toolName);
+          if (!tool) {
+            sendError(id, -32602, `Unknown tool: ${String(toolName)}`);
+            return;
+          }
+          validateMonitorArgs(toolArgs, tool);
+          if (toolName === 'codex_ui_list_conversations') result = handleMonitorList();
+          else if (toolName === 'codex_ui_get_conversation') result = handleMonitorGet(toolArgs);
+          else if (toolName === 'codex_ui_steer') result = await handleMonitorSteer(toolArgs, controller.signal);
+          else result = await handleMonitorAction(toolArgs, controller.signal);
         }
         sendResult(id, result);
       } catch (error) {
@@ -1846,6 +2298,7 @@ async function main() {
         // unconfirmed teardown or still-running archive operations.
         logError(`dirty shutdown (drained=${drained}, runsOk=${runsOk}, receiptsOk=${receiptsOk}, warmOk=${warmOk}); retaining lock until process exit`);
       }
+      transcriptStore.flushAll();
       return drained && runsOk && receiptsOk && warmOk && storeOk;
     })();
     return shutdownPromise;

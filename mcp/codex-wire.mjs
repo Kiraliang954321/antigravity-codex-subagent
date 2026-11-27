@@ -13,6 +13,9 @@ const HEARTBEAT_PHASE_BY_METHOD = Object.freeze({
   'item/commandExecution/outputDelta': 'executing',
   'item/plan/delta': 'planning',
 });
+const STREAM_CHANNEL_BY_PHASE = Object.freeze({
+  thinking: 'reasoning', streaming: 'agentMessage', executing: 'commandOutput', planning: 'plan',
+});
 
 export class CodexRpcError extends Error {
   constructor(code, message, data, method) {
@@ -174,6 +177,39 @@ function extractActivityKind(item) {
   }
 }
 
+function summarizeActivity(item) {
+  const summary = typeof item.status === 'string' ? { status: item.status } : {};
+  switch (item.type) {
+    case 'commandExecution': {
+      let command = item.command;
+      if (Array.isArray(command)) {
+        try { command = command.join(' '); } catch { command = undefined; }
+      }
+      if (typeof command === 'string') summary.command = command.slice(0, 512);
+      if (typeof item.exitCode === 'number') summary.exitCode = item.exitCode;
+      return summary;
+    }
+    case 'fileChange':
+      if (Array.isArray(item.changes)) {
+        summary.files = item.changes.slice(0, 20).map((change) =>
+          typeof change === 'string' ? change : change?.path).filter((file) => typeof file === 'string' && file);
+      }
+      return summary;
+    case 'mcpToolCall':
+    case 'dynamicToolCall':
+      if (typeof item.server === 'string') summary.server = item.server;
+      if (typeof item.tool === 'string') summary.tool = item.tool;
+      return summary;
+    case 'agentMessage':
+      if (item.phase === 'commentary') {
+        return { phase: 'commentary', ...(typeof item.text === 'string' ? { text: item.text.slice(0, 2000) } : {}) };
+      }
+      return summary;
+    default:
+      return summary;
+  }
+}
+
 function extractDiffFiles(diffText) {
   if (typeof diffText !== 'string' || !diffText) return [];
   const seen = new Set();
@@ -249,6 +285,7 @@ export function createCodexWire({
   let compactedObserved = false;
   let terminalObserved = false;
   let earlyActivityNotifications = [];
+  const earlyStreamNotifications = [];
   const earlyTelemetryByTurnId = new Map();
   const earlyPlanByTurnId = new Map();
   const earlyDiffByTurnId = new Map();
@@ -563,6 +600,20 @@ export function createCodexWire({
           turnId: activeTurnId ?? id,
         });
       }
+      if (typeof params.delta === 'string' && params.delta.length > 0) {
+        const streamEvent = {
+          type: 'streamDelta',
+          channel: STREAM_CHANNEL_BY_PHASE[heartbeatPhase],
+          threadId: activeThreadId,
+          turnId: activeTurnId ?? id,
+          itemId: typeof params.itemId === 'string' && params.itemId ? params.itemId : null,
+          delta: params.delta.slice(0, 8192),
+        };
+        if (activeTurnId !== undefined) emitDiagnostic(streamEvent);
+        else if (earlyStreamNotifications.length < MAX_EARLY_TURN_NOTIFICATIONS) {
+          earlyStreamNotifications.push({ streamEvent, order: order ?? nextOrder() });
+        }
+      }
       return;
     }
 
@@ -612,6 +663,17 @@ export function createCodexWire({
         filesChangedCount: files.length,
         files: files.slice(0, 20),
       });
+      if (typeof params.diff === 'string' && params.diff.length > 0) {
+        emitDiagnostic({
+          type: 'diffDetail',
+          threadId: activeThreadId,
+          turnId: activeTurnId ?? id ?? null,
+          filesChangedCount: files.length,
+          files: files.slice(0, 50),
+          diff: params.diff.slice(0, 32768),
+          truncated: params.diff.length > 32768,
+        });
+      }
       return;
     }
 
@@ -678,6 +740,10 @@ export function createCodexWire({
           kind,
           phase: 'started',
         });
+        emitDiagnostic({
+          type: 'activityDetail', threadId: activeThreadId, turnId: activeTurnId,
+          itemId: item.id, kind, phase: 'started', summary: summarizeActivity(item),
+        });
       }
       return;
     }
@@ -711,6 +777,10 @@ export function createCodexWire({
           itemId: item.id,
           kind,
           phase: 'completed',
+        });
+        emitDiagnostic({
+          type: 'activityDetail', threadId: activeThreadId, turnId: activeTurnId,
+          itemId: item.id, kind, phase: 'completed', summary: summarizeActivity(item),
         });
       }
       if (recordDeclinedItem(item, order)) return;
@@ -783,6 +853,9 @@ export function createCodexWire({
       recordDiagnostic(deferredDiag.request, deferredDiag.decision, deferredDiag.reason, deferredDiag.order);
     }
     const toReplay = [];
+    for (const entry of earlyStreamNotifications.splice(0)) {
+      if (entry.streamEvent.turnId === id) toReplay.push(entry);
+    }
     for (const entry of earlyActivityNotifications.splice(0)) {
       if (entry.turnId === id && entry.method !== 'turn/started') {
         toReplay.push(entry);
@@ -810,7 +883,8 @@ export function createCodexWire({
     }
     toReplay.sort((a, b) => a.order - b.order);
     for (const entry of toReplay) {
-      handleNotification(entry.method, entry.params, entry.order);
+      if (entry.streamEvent) emitDiagnostic(entry.streamEvent);
+      else handleNotification(entry.method, entry.params, entry.order);
     }
     const earlyCompletion = earlyTurnCompletions.get(id);
     earlyTurnCompletions.clear();
@@ -1015,6 +1089,7 @@ export function createCodexWire({
     compactedObserved = false;
     terminalObserved = false;
     earlyActivityNotifications = [];
+    earlyStreamNotifications.length = 0;
     earlyTelemetryByTurnId.clear();
     earlyPlanByTurnId.clear();
     earlyDiffByTurnId.clear();
@@ -1085,7 +1160,7 @@ export function createCodexWire({
         clientInfo: {
           name: 'codex-subagent',
           title: 'Antigravity Codex Subagent',
-          version: '0.4.0',
+          version: '0.5.0',
         },
         capabilities: {
           experimentalApi: false,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -20,6 +20,7 @@ const wireMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'codex-
 const clientMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'codex-client.mjs')).href);
 const storeMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'session-store.mjs')).href);
 const pathGuardMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'local-path-guard.mjs')).href);
+const transcriptMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'transcript-store.mjs')).href);
 
 // Minimal valid 1x1 red PNG
 const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -126,7 +127,7 @@ async function test(name, fn) {
   }
 }
 
-console.log('=== Part A: Unit, Mock MCP Server & v0.4.0 Feature Tests ===');
+console.log('=== Part A: Unit, Mock MCP Server & v0.5.0 Feature Tests ===');
 
 await test('1. codex-wire stale prior-turn isolation, 300+ early telemetry bursts preserving turn/completed, & turnTimeoutMs', async () => {
   const stdin = new PassThrough();
@@ -155,7 +156,7 @@ await test('1. codex-wire stale prior-turn isolation, 300+ early telemetry burst
 
       if (msg.method === 'initialize') {
         assert.equal(msg.params.clientInfo.name, 'codex-subagent');
-        assert.equal(msg.params.clientInfo.version, '0.4.0');
+        assert.equal(msg.params.clientInfo.version, '0.5.0');
         stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} })}\n`);
       } else if (msg.method === 'thread/start') {
         stdout.write(`${JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'th-1', ephemeral: false } } })}\n`);
@@ -231,7 +232,7 @@ await test('2. Live telemetry concurrency, duplicate turn/started idempotency, p
   });
   try {
     const init = await srv.request('initialize', { protocolVersion: '2024-11-05' });
-    assert.equal(init.serverInfo.version, '0.4.0');
+    assert.equal(init.serverInfo.version, '0.5.0');
 
     const runRes = await srv.callTool('subagent_codex', {
       description: 'Telemetry test run',
@@ -505,7 +506,7 @@ await test('4. Non-blocking startup recovery + full rollout validation', async (
   try {
     const init = await srv.request('initialize', { protocolVersion: '2024-11-05' });
     const initElapsed = Date.now() - tStart;
-    assert.equal(init.serverInfo.version, '0.4.0');
+    assert.equal(init.serverInfo.version, '0.5.0');
     assert.ok(initElapsed < 700, `startup initialize (${initElapsed}ms) must not block on slow uncertain probes`);
 
     let byKey = {};
@@ -1460,6 +1461,269 @@ await test('16. action: "fork" branching with lastTurnId, source protection unde
     }
   } finally {
     await store2.dispose();
+  }
+});
+
+async function pollMonitor(check, timeoutMs = 6000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await check();
+    if (value) return value;
+    assert.ok(Date.now() < deadline, 'monitor polling timed out');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+function monitorEnv(dir, extra = {}) {
+  return {
+    CODEX_WRAPPER_PATH: MOCK_WRAPPER,
+    CODEX_SESSION_STORE_PATH: path.join(dir, 'sessions.json'),
+    MOCK_CODEX_STATE_DIR: path.join(dir, 'mock'),
+    CODEX_MONITOR_HTML: '',
+    ...extra,
+  };
+}
+
+function monitorPayload(result) {
+  assert.ok(!result.isError, toolText(result));
+  assert.deepEqual(JSON.parse(toolText(result)), result.structuredContent);
+  return result.structuredContent;
+}
+
+await test('18. MCP Apps resource discovery, fresh override, and app-only tool metadata', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'monitor-resource');
+  mkdirSync(dir);
+  const override = path.join(dir, 'override.html');
+  const uri = 'ui://codex-subagent/monitor.html';
+  const mimeType = 'text/html;profile=mcp-app';
+  const srv = startMcpServer(monitorEnv(dir));
+  try {
+    assert.deepEqual((await srv.request('initialize')).capabilities, { tools: {}, resources: {} });
+    const { resources } = await srv.request('resources/list');
+    assert.deepEqual(resources, [{
+      uri, mimeType, name: 'Codex Subagent Monitor', description: 'Live Gemini <-> Codex monitor and interactive control panel.',
+      _meta: { ui: { prefersBorder: false } },
+    }]);
+    const { contents } = await srv.request('resources/read', { uri });
+    assert.equal(contents[0].mimeType, mimeType);
+    assert.deepEqual(contents[0]._meta, resources[0]._meta);
+    assert.match(contents[0].text, /<!doctype html>/i);
+    assert.match(contents[0].text, /Codex Monitor/);
+    await assert.rejects(srv.request('resources/read', { uri: `${uri}/unknown` }), /RPC error -32602/);
+    const { tools } = await srv.request('tools/list');
+    const open = tools.find((tool) => tool.name === 'subagent_codex_monitor');
+    assert.equal(open._meta.ui.resourceUri, uri);
+    assert.deepEqual(open._meta['com.google.antigravity/ui'].entrypoints, [
+      { type: 'aux_pane', title: 'Codex Monitor' }, { type: 'global', title: 'Codex Subagent' },
+    ]);
+    const appTools = tools.filter((tool) => tool.name.startsWith('codex_ui_'));
+    assert.deepEqual(appTools.map((tool) => tool.name).sort(), [
+      'codex_ui_action', 'codex_ui_get_conversation', 'codex_ui_list_conversations', 'codex_ui_steer',
+    ]);
+    for (const tool of appTools) assert.deepEqual(tool._meta.ui.visibility, ['app']);
+    const opened = await srv.callTool(open.name, {});
+    assert.match(toolText(opened), /Codex Subagent Monitor/);
+    assert.deepEqual(opened.structuredContent, { serverVersion: '0.5.0', initialConversationId: null, counts: { running: 0, sessions: 0, total: 0 } });
+  } finally {
+    await srv.stop();
+  }
+  const custom = startMcpServer(monitorEnv(dir, { CODEX_MONITOR_HTML: override }));
+  try {
+    await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
+    for (const html of ['<!doctype html><p>first</p>', '<!doctype html><p>second</p>']) {
+      writeFileSync(override, html);
+      assert.equal((await custom.request('resources/read', { uri })).contents[0].text, html);
+    }
+    writeFileSync(override, '');
+    await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
+    const fd = openSync(override, 'w');
+    try { ftruncateSync(fd, 10 * 1024 * 1024 + 1); } finally { closeSync(fd); }
+    await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
+  } finally {
+    await custom.stop();
+  }
+});
+
+await test('19. UI transcript coalescing, incremental polling, redaction, safe links, limits, and restart', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'monitor-transcript');
+  const cwd = path.join(dir, 'work');
+  mkdirSync(cwd, { recursive: true });
+  const inside = path.join(cwd, 'inside.txt');
+  writeFileSync(inside, 'inside');
+  writeFileSync(path.join(dir, 'outside.txt'), 'outside');
+  symlinkSync(dir, path.join(cwd, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+  const env = monitorEnv(dir);
+  const transcriptDir = transcriptMod.resolveIsolatedTranscriptsDir(env.CODEX_SESSION_STORE_PATH);
+  mkdirSync(transcriptDir, { recursive: true });
+  writeFileSync(path.join(transcriptDir, 'conv-00000000000000000000.json'), 'invalid JSON');
+  const sessionKey = 'monitor:session';
+  const conversationId = `session:${sessionKey}`;
+  const srv = startMcpServer(env);
+  let streamEvent;
+  let jobId;
+  try {
+    const running = await srv.callTool('subagent_codex', {
+      cwd, sessionKey, description: 'Monitor stream', prompt: JSON.stringify({ mode: 'ui_stream', bulkDiffs: 9 }), waitMs: 1000,
+    }, { progressToken: 'monitor-private' });
+    const live = JSON.parse(toolText(running));
+    assert.equal(live.status, 'running');
+    jobId = live.jobId;
+    assert.equal((await srv.callTool('subagent_codex_monitor', { jobId })).structuredContent.initialConversationId, conversationId);
+    const before = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
+    assert.equal(before.liveJob.jobId, jobId);
+    assert.equal(before.liveJob.steerable, true);
+    assert.equal(before.conversation.turnCount, 1);
+    assert.equal(before.conversation.latestPlan.explanation, 'Inspect tokens and credentials');
+    assert.deepEqual(before.fileLinks, [{ path: 'inside.txt', uri: pathToFileURL(inside).href }]);
+    assert.ok(before.events.some((event) => event.type === 'diff' && event.diff.includes('SECRET_DIFF_BODY')));
+    assert.ok(before.events.some((event) => event.type === 'stream' && event.channel === 'commandOutput' && event.text === 'SECRET_CMD_DELTA_LINE'));
+    assert.ok(before.events.some((event) => event.type === 'stream' && event.channel === 'agentMessage'));
+    assert.ok(before.events.some((event) => event.type === 'activity' && event.summary.command === 'echo Bearer [REDACTED]'));
+    assert.ok(before.events.some((event) => event.type === 'activity' && event.summary.exitCode === 0));
+    streamEvent = before.events.find((event) => event.type === 'stream' && event.channel === 'reasoning');
+    assert.equal(streamEvent.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-');
+    assert.doesNotMatch(JSON.stringify([running, srv.getNotifications()]), /SECRET_THOUGHT_DELTA|SECRET_CMD_DELTA_LINE|SECRET_DIFF_BODY|abcdefgh12345678/);
+
+    writeFileSync(path.join(env.MOCK_CODEX_STATE_DIR, 'continue-ui-stream'), 'go');
+    await pollMonitor(async () => {
+      const listed = monitorPayload(await srv.callTool('codex_ui_list_conversations'));
+      return listed.conversations[0]?.status === 'completed_unclaimed';
+    });
+    const incremental = await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: before.nextSeq });
+    assert.ok(Buffer.byteLength(JSON.stringify(incremental), 'utf8') <= 512 * 1024);
+    const batch = monitorPayload(incremental);
+    assert.equal(batch.truncated, true);
+    assert.equal(batch.hasMore, true);
+    const updated = batch.events.find((event) => event.eventId === streamEvent.eventId);
+    assert.ok(updated.seq > before.nextSeq);
+    assert.equal(updated.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-[REDACTED] Bearer [REDACTED] complete');
+    assert.equal(batch.nextSeq, batch.events.at(-1).seq);
+    const later = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: batch.nextSeq, limit: 1 }));
+    assert.ok(later.events[0].seq > batch.nextSeq);
+    const transcriptFile = `conv-${createHash('sha256').update(conversationId).digest('hex').slice(0, 20)}.json`;
+    assert.ok(readdirSync(transcriptDir).includes(transcriptFile));
+    assert.doesNotMatch(readFileSync(path.join(transcriptDir, transcriptFile), 'utf8'), /sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ|abcdefgh12345678|NOT_ACTIVITY_SUMMARY/);
+  } finally {
+    await srv.stop();
+  }
+  const restarted = startMcpServer(env);
+  try {
+    const restored = monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, limit: 5 }));
+    assert.equal(restored.conversation.status, 'completed_unclaimed');
+    assert.equal(restored.liveJob, null);
+    assert.deepEqual(restored.fileLinks, [{ path: 'inside.txt', uri: pathToFileURL(inside).href }]);
+    assert.equal((await restarted.callTool('codex_ui_action', { action: 'clear_history', conversationId })).isError, true);
+    assert.ok(!(await restarted.callTool('subagent_codex_wait', { jobId })).isError);
+    assert.equal(monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, afterSeq: restored.nextSeq, limit: 1 })).events.length, 1);
+  } finally {
+    await restarted.stop();
+  }
+});
+
+await test('20. UI mid-turn steer and cancel preserve Gemini job claims', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'monitor-steer');
+  mkdirSync(dir);
+  const srv = startMcpServer(monitorEnv(dir));
+  try {
+    const run = async (mode, options = {}) => JSON.parse(toolText(await srv.callTool('subagent_codex', {
+      cwd: dir, description: 'Monitor action', prompt: JSON.stringify({ mode, ...options }), waitMs: 1000,
+    })));
+    const first = await run('wait_for_steer', { maxWaitMs: 8000, afterSteerDelayMs: 1500 });
+    assert.equal(first.status, 'running');
+    const steerText = 'Continue with the UI instruction';
+    const steered = monitorPayload(await srv.callTool('codex_ui_steer', { jobId: first.jobId, steer: steerText }));
+    assert.deepEqual(steered, { ok: true, jobId: first.jobId, turnId: first.telemetry.turnId });
+    const conversationId = `ephemeral:${first.jobId}`;
+    const current = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
+    assert.equal(current.liveJob.status, 'running');
+    const steerEvents = current.events.filter((event) => event.type === 'steer');
+    assert.equal(steerEvents.length, 1);
+    assert.equal(steerEvents[0].source, 'user_ui');
+    assert.equal(steerEvents[0].text, steerText);
+    const reply = await srv.callTool('subagent_codex_wait', { jobId: first.jobId, waitMs: 5000 });
+    assert.deepEqual(JSON.parse(toolText(reply).split('\n\n[codex-thread')[0]).steeredInputs, [{ text: steerText, images: [] }]);
+    assert.equal((await srv.callTool('codex_ui_steer', { jobId: first.jobId, steer: 'too late' })).isError, true);
+
+    const second = await run('hang_turn');
+    const cancelled = monitorPayload(await srv.callTool('codex_ui_action', { action: 'cancel', jobId: second.jobId }));
+    assert.deepEqual(cancelled, { ok: true, action: 'cancel', jobId: second.jobId, settled: true });
+    const cancelledId = `ephemeral:${second.jobId}`;
+    const settled = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId: cancelledId }));
+    assert.equal(settled.liveJob.status, 'completed_unclaimed');
+    assert.ok(settled.events.some((event) => event.type === 'cancel' && event.source === 'user_ui'));
+    assert.equal((await srv.callTool('codex_ui_action', { action: 'clear_history', conversationId: cancelledId })).isError, true);
+    const claim = await srv.callTool('subagent_codex_wait', { jobId: second.jobId });
+    assert.equal(claim.isError, true);
+    assert.match(toolText(claim), /cancel|abort/i);
+    assert.doesNotMatch(toolText(claim), /unknown or already claimed/i);
+    assert.match(toolText(await srv.callTool('subagent_codex_wait', { jobId: second.jobId })), /unknown or already claimed/i);
+  } finally {
+    await srv.stop();
+  }
+});
+
+await test('21. UI compact, fork, close, and guarded history deletion', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'monitor-lifecycle');
+  mkdirSync(dir);
+  const env = monitorEnv(dir, { MOCK_CODEX_COMPACT_DELAY_MS: '3400' });
+  const legacyThreadId = randomUUID();
+  const legacyStore = await storeMod.openCodexSessionStore({ file: env.CODEX_SESSION_STORE_PATH });
+  try {
+    const lease = await legacyStore.acquire({ sessionKey: 'legacy', cwd: dir });
+    try { await lease.commit({ threadId: legacyThreadId }); } finally { lease.release(); }
+  } finally {
+    await legacyStore.dispose();
+  }
+  const srv = startMcpServer(env);
+  try {
+    const action = (args) => srv.callTool('codex_ui_action', args);
+    const get = async (conversationId) => monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
+    const legacy = await get('session:legacy');
+    assert.equal(legacy.conversation.threadId, legacyThreadId);
+    assert.equal(legacy.conversation.status, 'ready');
+    assert.deepEqual(legacy.events, []);
+    assert.equal((await action({ action: 'clear_history', conversationId: 'session:legacy' })).isError, true);
+    const run = (more) => srv.callTool('subagent_codex', { cwd: dir, description: 'Lifecycle source', prompt: '{}', waitMs: 5000, ...more });
+    const source = await run({ sessionKey: 'source' });
+    assert.ok(!source.isError, toolText(source));
+    const { conversation: sourceMeta } = await get('session:source');
+    assert.equal((await action({ action: 'clear_history', conversationId: 'session:source' })).isError, true);
+    assert.equal((await action({ action: 'compact', sessionKey: 'source', cwd: dir })).isError, true);
+    assert.equal((await action({ action: 'fork', sessionKey: 'source', targetSessionKey: 'invalid key' })).isError, true);
+
+    const compact = monitorPayload(await action({ action: 'compact', threadId: sourceMeta.threadId }));
+    assert.equal(compact.status, 'running');
+    assert.equal((await get('session:source')).liveJob.jobId, compact.jobId);
+    assert.equal((await action({ action: 'close', sessionKey: 'source' })).isError, true);
+    assert.equal((await action({ action: 'fork', sessionKey: 'source', targetSessionKey: 'busy-target' })).isError, true);
+    await pollMonitor(async () => !(await get('session:source')).liveJob);
+    assert.ok((await get('session:source')).events.some((event) => event.type === 'compact' && !event.isError));
+    const jobsDir = isolatedJobsDirFor(env.CODEX_SESSION_STORE_PATH);
+    assert.ok(!existsSync(path.join(jobsDir, `${compact.jobId}.json`)));
+    assert.deepEqual(JSON.parse(toolText(await srv.callTool('subagent_codex_list_sessions'))).activeJobs, []);
+
+    const fork = monitorPayload(await action({ action: 'fork', sessionKey: 'source', targetSessionKey: 'target:fork' }));
+    assert.equal(fork.sourceThreadId, sourceMeta.threadId);
+    assert.notEqual(fork.threadId, sourceMeta.threadId);
+    const targetId = 'session:target:fork';
+    assert.ok((await get(targetId)).events.some((event) => event.type === 'fork' && event.sourceThreadId === sourceMeta.threadId));
+    assert.equal((await action({ action: 'clear_history', conversationId: targetId })).isError, true);
+    assert.equal(monitorPayload(await action({ action: 'close', threadId: fork.threadId })).closed, true);
+    assert.equal((await get(targetId)).conversation.status, 'closed');
+    assert.ok((await get(targetId)).events.some((event) => event.type === 'closed'));
+    assert.equal(monitorPayload(await action({ action: 'clear_history', conversationId: targetId })).deleted, true);
+    assert.equal((await srv.callTool('codex_ui_get_conversation', { conversationId: targetId })).isError, true);
+
+    const ephemeral = await run({});
+    assert.ok(!ephemeral.isError, toolText(ephemeral));
+    const listing = monitorPayload(await srv.callTool('codex_ui_list_conversations'));
+    assert.equal(listing.conversations[0].conversationId, 'session:source');
+    const ephemeralId = listing.conversations.find((entry) => entry.kind === 'ephemeral').conversationId;
+    assert.match(ephemeralId, /^ephemeral:/);
+    assert.equal(monitorPayload(await action({ action: 'clear_history', conversationId: ephemeralId })).deleted, true);
+    assert.equal((await srv.callTool('codex_ui_get_conversation', { conversationId: ephemeralId })).isError, true);
+  } finally {
+    await srv.stop();
   }
 });
 
