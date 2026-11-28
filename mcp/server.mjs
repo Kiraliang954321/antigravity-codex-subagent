@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { StringDecoder } from 'node:string_decoder';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import {
   CODEX_PERMISSION_MODES,
   CODEX_SANDBOX_MODES,
@@ -24,9 +24,7 @@ import {
 import { createDiskJobStore, resolveIsolatedJobsDir } from './disk-job-store.mjs';
 import {
   assertUsableCwd,
-  isUncOrDevicePath,
   resolveAccessibleCwd,
-  resolveLocalPathWithoutRemoteTraversal,
   validateLocalImages,
 } from './local-path-guard.mjs';
 import {
@@ -38,33 +36,32 @@ import {
   validateSessionKey,
   validateThreadId,
 } from './session-store.mjs';
-import {
-  AVATAR_PRESET_IDS,
-  MODEL_PATTERN,
-  REASONING_EFFORT_PATTERN,
-  SETTINGS_LIMITS,
-  createSettingsStore,
-  resolveIsolatedSettingsPath,
-  validateSettingsPatch,
-} from './settings-store.mjs';
 import { spawnSubprocess } from './subprocess-adapter.mjs';
-import { canonicalConversationId, createTranscriptStore, redactSecrets, resolveIsolatedTranscriptsDir } from './transcript-store.mjs';
 
 const SERVER_NAME = 'codex-subagent';
 const SERVER_VERSION = '0.5.0';
 const DEFAULT_MODEL = undefined;
 const PROTOCOL_FALLBACK_VERSION = '2024-11-05';
-const MONITOR_RESOURCE_URI = 'ui://codex-subagent/monitor.html';
-const MONITOR_RESOURCE_MIME = 'text/html;profile=mcp-app';
-const MAX_MONITOR_HTML_BYTES = 10 * 1024 * 1024;
-const MAX_UI_RESPONSE_BYTES = 512 * 1024;
-const MAX_SNAPSHOT_BYTES = 192 * 1024;
-const MAX_SNAPSHOT_LIST_BYTES = 32 * 1024;
-const MAX_SNAPSHOT_CONVERSATIONS = 32;
-const MAX_FILE_LINK_CANDIDATES = 64;
-const STREAM_CHANNEL_BY_ITEM_TYPE = Object.freeze({
-  commandExecution: 'commandOutput', reasoning: 'reasoning', plan: 'plan', agentMessage: 'agentMessage',
-});
+const SETTINGS_RESOURCE_URI = 'ui://codex-subagent/settings.html';
+const SETTINGS_RESOURCE_MIME = 'text/html;profile=mcp-app';
+const MAX_SETTINGS_HTML_BYTES = 10 * 1024 * 1024;
+const SETTINGS_LIMITS = Object.freeze({ maxModelLength: 128 });
+const EMPTY_RATE_LIMITS = {
+  available: false,
+  planType: null,
+  ordinaryUsageAllowed: null,
+  windows: [],
+  credits: null,
+  spendControlReached: null,
+  rateLimitReachedType: null,
+  updatedAt: null,
+  error: null,
+};
+const RATE_LIMIT_KINDS = new Set(['five_hour', 'weekly', 'daily', 'window']);
+const PLAN_TYPE_PATTERN = /^[a-z0-9_-]{1,48}$/i;
+const RATE_LIMIT_REACHED_PATTERN = /^[a-z0-9_-]{1,64}$/i;
+const MODEL_PATTERN = /^[^\s\p{Cc}\p{Cf}]{1,128}$/u;
+const REASONING_EFFORT_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 
 const DEFAULT_WAIT_MS = 120_000;
 const MIN_WAIT_MS = 1_000;
@@ -233,160 +230,86 @@ const LIST_SESSIONS_TOOL = Object.freeze({
   },
 });
 
-const MONITOR_RESOURCE = {
-  uri: MONITOR_RESOURCE_URI,
-  name: 'Codex Subagent Monitor',
-  description: 'Live Gemini <-> Codex monitor and interactive control panel.',
-  mimeType: MONITOR_RESOURCE_MIME,
+const SETTINGS_RESOURCE = {
+  uri: SETTINGS_RESOURCE_URI,
+  name: 'Codex Subagent Settings',
+  description: 'Configure default Codex model and reasoning effort synced with ~/.codex/config.toml.',
+  mimeType: SETTINGS_RESOURCE_MIME,
   _meta: { ui: { prefersBorder: false } },
 };
 
-const UI_STRING = { type: 'string', minLength: 1 };
-const SUBAGENT_CODEX_MONITOR_TOOL = {
-  name: 'subagent_codex_monitor',
-  description: 'Open the Codex Subagent Monitor, optionally focused on a conversation, session, or job.',
-  inputSchema: {
-    type: 'object', additionalProperties: false,
-    properties: { conversationId: UI_STRING, sessionKey: UI_STRING, jobId: UI_STRING },
-  },
+const SUBAGENT_CODEX_SETTINGS_TOOL = {
+  name: 'subagent_codex_settings',
+  description: 'Open the Codex Subagent default model and reasoning effort settings panel.',
+  inputSchema: { type: 'object', additionalProperties: false, properties: {} },
   _meta: {
-    ui: { resourceUri: MONITOR_RESOURCE_URI },
+    ui: { resourceUri: SETTINGS_RESOURCE_URI },
     'com.google.antigravity/ui': {
-      entrypoints: [{ type: 'aux_pane', title: 'Codex Monitor' }, { type: 'global', title: 'Codex Subagent' }],
+      entrypoints: [{ type: 'global', title: 'Codex Subagent' }],
     },
   },
 };
 
-function appTool(name, description, properties, required = []) {
+function appTool(name, description, properties) {
   return {
     name, description,
-    inputSchema: { type: 'object', additionalProperties: false, properties, required },
+    inputSchema: { type: 'object', additionalProperties: false, properties },
     _meta: { ui: { visibility: ['app'] } },
   };
 }
 
-const MONITOR_APP_TOOLS = [
-  appTool('codex_ui_list_conversations', 'List monitor conversations and active jobs.', {
-    include: { type: 'string', enum: ['initialConversation'] },
-    conversationId: UI_STRING,
-  }),
-  appTool('codex_ui_get_conversation', 'Poll monitor events for a conversation.', {
-    conversationId: UI_STRING,
-    cursorEpoch: UI_STRING,
-    afterSeq: { type: 'integer', minimum: 0 },
-    limit: { type: 'integer', minimum: 1, maximum: 400 },
-  }, ['conversationId']),
-  appTool('codex_ui_steer', 'Steer an active Codex turn without waiting for it to finish.', {
-    jobId: UI_STRING, steer: UI_STRING,
-  }, ['jobId', 'steer']),
-  appTool('codex_ui_action', 'Manage a monitor job, owned session, or its history.', {
-    action: { type: 'string', enum: ['cancel', 'compact', 'fork', 'close', 'clear_history'] },
-    jobId: UI_STRING, sessionKey: UI_STRING, threadId: UI_STRING, targetSessionKey: UI_STRING, conversationId: UI_STRING,
-  }, ['action']),
-  appTool('codex_ui_get_settings', 'Get Monitor role appearance and Codex runtime default settings.', {
+const SETTINGS_APP_TOOLS = [
+  appTool('codex_ui_get_settings', 'Get Codex default model and reasoning effort settings.', {
     syncCodex: { type: 'boolean' },
   }),
-  appTool('codex_ui_update_settings', 'Update Monitor role appearance and Codex runtime default settings.', {
+  appTool('codex_ui_update_settings', 'Update Codex default model and reasoning effort settings.', {
     reset: { type: 'boolean' },
-    roles: { type: 'object' },
-    codex: { type: 'object' },
+    codex: {
+      type: 'object', additionalProperties: false,
+      properties: { model: { type: ['string', 'null'] }, reasoningEffort: { type: ['string', 'null'] } },
+    },
   }),
 ];
 
-function uiResult(structuredContent, text = 'ok', isError = false) {
-  return {
-    content: [{ type: 'text', text: isError ? String(structuredContent?.error ?? text) : text }],
-    structuredContent,
-    ...(isError ? { isError: true } : {}),
-  };
+function uiResult(structuredContent, text = 'ok') {
+  return { content: [{ type: 'text', text }], structuredContent };
 }
 
-function jsonBytes(value) {
-  return Buffer.byteLength(JSON.stringify(value), 'utf8');
+function redactSecrets(text) {
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/g, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, 'sk-[REDACTED]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, '[REDACTED]')
+    .replace(/\bAIza[0-9A-Za-z_-]{30,}\b/g, '[REDACTED]')
+    .replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]');
 }
 
-function validateMonitorArgs(args, { name, inputSchema }) {
-  if (!isPlainObject(args)) throw new Error(`${name}: arguments must be an object`);
-  for (const key of inputSchema.required ?? []) {
-    if (!Object.hasOwn(args, key)) throw new Error(`${name}: ${key} is required`);
+function validateSettingsArgs(args, name, keys) {
+  if (!isPlainObject(args) || Object.getPrototypeOf(args) !== Object.prototype) {
+    throw new Error(name + ': arguments must be a plain object');
   }
-  for (const [key, value] of Object.entries(args)) {
-    if (!Object.hasOwn(inputSchema.properties, key)) throw new Error(`${name}: unknown argument "${key}"`);
-    const schema = inputSchema.properties[key];
-    if ((schema.type === 'string' && (typeof value !== 'string' || !value.trim()))
-      || (schema.type === 'integer' && (!Number.isSafeInteger(value) || value < schema.minimum || value > (schema.maximum ?? Infinity)))
-      || (schema.type === 'boolean' && typeof value !== 'boolean')
-      || (schema.type === 'object' && !isPlainObject(value))
-      || (schema.enum && !schema.enum.includes(value))) throw new Error(`${name}: invalid ${key}`);
+  for (const key of Object.keys(args)) {
+    if (!keys.includes(key)) throw new Error(name + ': unknown argument "' + key + '"');
   }
 }
 
-function isInsideDirectory(directory, candidate) {
-  const relative = path.relative(directory, candidate);
-  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
-}
-
-function safeFileLinkResolver(cwd) {
-  const cache = new Map();
-  if (!cwd || !path.isAbsolute(cwd) || isUncOrDevicePath(cwd) || /^[\\/]{2}/.test(cwd)) return () => null;
-  const requestCache = new Map();
-  const resolveLocal = (candidate) => {
-    if (process.platform === 'win32' && candidate.slice(2).includes(':')) throw new Error('Invalid file path');
-    const safePath = resolveLocalPathWithoutRemoteTraversal(candidate, 'monitor path', { requestCache });
-    const realPath = realpathSync.native(safePath);
-    if (isUncOrDevicePath(realPath)) throw new Error('Invalid real path');
-    return realPath;
-  };
-  let realCwd;
-  try {
-    realCwd = resolveLocal(cwd);
-    if (!statSync(realCwd).isDirectory()) return () => null;
-  } catch { return () => null; }
-  return (file) => {
-    if (cache.has(file)) return cache.get(file);
-    let link = null;
-    if (typeof file === 'string' && file && !isUncOrDevicePath(file) && !/^[\\/]{2}/.test(file)
-      && !(process.platform === 'win32' && (/^[A-Za-z]:(?![\\/])/.test(file) || /^[\\/]/.test(file)))) {
-      try {
-        const candidate = path.resolve(cwd, file);
-        if (isInsideDirectory(cwd, candidate)) {
-          const realFile = resolveLocal(candidate);
-          if (isInsideDirectory(realCwd, realFile) && statSync(realFile).isFile()) {
-            link = { path: file, uri: pathToFileURL(realFile).href };
-          }
-        }
-      } catch {}
+function validateCodexSettingsPatch(patch, allowedEfforts) {
+  const name = 'codex_ui_update_settings';
+  validateSettingsArgs(patch, name, ['reset', 'codex']);
+  const { reset, codex } = patch;
+  if (reset !== undefined && typeof reset !== 'boolean') throw new Error(name + ': reset must be a boolean');
+  if (codex === undefined) return { reset };
+  validateSettingsArgs(codex, name + '.codex', ['model', 'reasoningEffort']);
+  const normalized = {};
+  for (const [key, value] of Object.entries(codex)) {
+    if (value !== null && typeof value !== 'string') throw new Error(name + ': ' + key + ' must be a string or null');
+    const trimmed = value?.trim() || null;
+    if (trimmed !== null && !(key === 'model' ? MODEL_PATTERN.test(trimmed) : allowedEfforts.has(trimmed))) {
+      throw new Error(name + ': invalid ' + key);
     }
-    cache.set(file, link);
-    return link;
-  };
-}
-
-function monitorFileCandidates(conversation, events) {
-  const candidates = new Set();
-  const addFiles = (files) => {
-    if (!Array.isArray(files)) return;
-    for (const file of files) {
-      if (candidates.size >= MAX_FILE_LINK_CANDIDATES) break;
-      if (typeof file === 'string' && file) candidates.add(file);
-    }
-  };
-  addFiles(conversation.latestDiffSummary?.files);
-  for (const event of events) {
-    if (candidates.size >= MAX_FILE_LINK_CANDIDATES) break;
-    if (event.type === 'diff') addFiles(event.files);
-    if (event.type === 'activity' && event.kind === 'fileChange') addFiles(event.summary?.files);
-    if (event.type !== 'answer' || typeof event.text !== 'string') continue;
-    for (const match of event.text.matchAll(/(?<!!)\[[^\]\r\n]*\]\(\s*(?:<([^<>\r\n]+)>|([^\s()<>]+))\s*\)/g)) {
-      if (candidates.size >= MAX_FILE_LINK_CANDIDATES) break;
-      let file = (match[1] ?? match[2]).replace(/:(?:[0-9]+)(?::[0-9]+)?$/, '');
-      if (process.platform === 'win32') file = file.replace(/^\/(?=[A-Za-z]:[\\/])/, '');
-      if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(file)
-        && !(process.platform === 'win32' && /^[A-Za-z]:[\\/]/.test(file))) continue;
-      addFiles([file]);
-    }
+    normalized[key] = trimmed;
   }
-  return candidates;
+  return { reset, codex: normalized };
 }
 
 function logError(message) {
@@ -1004,7 +927,6 @@ function snapshotTelemetry(job) {
 
 async function main() {
   const config = loadConfig();
-  const settingsStore = createSettingsStore(resolveIsolatedSettingsPath(config.storePath), { reasoningEfforts: REASONING_EFFORTS, logError });
   let codexSnap = {
     synced: false,
     model: null,
@@ -1016,9 +938,10 @@ async function main() {
     overridden: false,
     overriddenMessage: null,
     error: null,
+    rateLimits: { ...EMPTY_RATE_LIMITS, windows: [] },
   };
   let syncPromise = null;
-  let monitorCodexOverride = null;
+  let codexConfigOverride = null;
   let settingsUpdate = Promise.resolve();
   const codexConfigOptions = (signal) => ({
     spawn: spawnSubprocess,
@@ -1043,14 +966,46 @@ async function main() {
   // RPC diagnostics and override messages can include paths from Codex layers.
   const pathInText = /(?:\b[a-z]:[\\/]|\\\\|file:\/|(?:^|[\s"'(`=])(?:~?\/|~\\)\S)/i;
   const safeMessage = (message) => message && (pathInText.test(message) ? '[local path redacted]' : redactSecrets(message));
-  const safeModel = (model) => (typeof model === 'string' && MODEL_PATTERN.test(model) && !pathInText.test(model) ? model : null);
-  const safeEffort = (effort) => effort && !pathInText.test(effort) ? effort : null;
+  const safeModel = (model) => (typeof model === 'string' && MODEL_PATTERN.test(model) && safeMessage(model) === model ? model : null);
+  const safeEffort = (effort) => (typeof effort === 'string' && REASONING_EFFORT_PATTERN.test(effort) && safeMessage(effort) === effort ? effort : null);
+  const safeClampPercent = (value) => Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0;
+  const sanitizeRateLimits = (raw) => {
+    const updatedAt = typeof raw?.updatedAt === 'string' ? raw.updatedAt : null;
+    const error = safeMessage(typeof raw?.error === 'string' ? raw.error : null) ?? null;
+    if (!isPlainObject(raw) || raw.available !== true) {
+      return { ...EMPTY_RATE_LIMITS, windows: [], updatedAt, error };
+    }
+
+    const timestamp = Date.parse(updatedAt);
+    const windows = Array.isArray(raw.windows) ? raw.windows.filter(isPlainObject).map((window) => ({
+      kind: RATE_LIMIT_KINDS.has(window.kind) ? window.kind : 'window',
+      usedPercent: safeClampPercent(window.usedPercent),
+      remainingPercent: safeClampPercent(window.remainingPercent),
+      windowDurationMins: Number.isInteger(window.windowDurationMins) && window.windowDurationMins > 0 ? window.windowDurationMins : null,
+      resetsAt: Number.isFinite(window.resetsAt) && window.resetsAt > 0 ? window.resetsAt : null,
+    })) : [];
+    const credits = raw.credits;
+    return {
+      available: true,
+      planType: typeof raw.planType === 'string' && PLAN_TYPE_PATTERN.test(raw.planType) ? raw.planType : null,
+      ordinaryUsageAllowed: typeof raw.ordinaryUsageAllowed === 'boolean' ? raw.ordinaryUsageAllowed : null,
+      windows,
+      credits: isPlainObject(credits) ? {
+        hasCredits: Boolean(credits.hasCredits),
+        unlimited: Boolean(credits.unlimited),
+        balance: credits.balance == null ? null : safeMessage(String(credits.balance).slice(0, 64)),
+      } : null,
+      spendControlReached: typeof raw.spendControlReached === 'boolean' ? raw.spendControlReached : null,
+      rateLimitReachedType: typeof raw.rateLimitReachedType === 'string' && RATE_LIMIT_REACHED_PATTERN.test(raw.rateLimitReachedType)
+        ? raw.rateLimitReachedType : null,
+      updatedAt: Number.isFinite(timestamp) && new Date(timestamp).toISOString() === updatedAt ? updatedAt : null,
+      error,
+    };
+  };
   const buildSettingsPayload = () => {
-    const stored = settingsStore.get();
     const { synced, model, reasoningEffort, catalogDefaultModel, catalogDefaultReasoningEffort, catalogAvailable,
       overridden, overriddenMessage, error } = codexSnap;
     return {
-      settings: { ...stored, codex: { model: safeModel(model), reasoningEffort: safeEffort(reasoningEffort) } },
       codexConfig: {
         synced, model: safeModel(model), reasoningEffort: safeEffort(reasoningEffort), catalogDefaultModel: safeModel(catalogDefaultModel),
         catalogDefaultReasoningEffort: safeEffort(catalogDefaultReasoningEffort), catalogAvailable, overridden,
@@ -1063,8 +1018,8 @@ async function main() {
         envReasoningEffort: config.reasoningEffort ?? null,
       },
       effective: {
-        model: safeModel(monitorCodexOverride?.model ?? config.model ?? model ?? catalogDefaultModel),
-        reasoningEffort: safeEffort(monitorCodexOverride?.reasoningEffort ?? config.reasoningEffort ?? reasoningEffort ?? catalogDefaultReasoningEffort),
+        model: safeModel(codexConfigOverride?.model ?? config.model ?? model ?? catalogDefaultModel),
+        reasoningEffort: safeEffort(codexConfigOverride?.reasoningEffort ?? config.reasoningEffort ?? reasoningEffort ?? catalogDefaultReasoningEffort),
       },
       options: {
         models: codexSnap.models.filter((entry) => safeModel(entry.id) && safeModel(entry.model)).map((entry) => ({
@@ -1077,23 +1032,22 @@ async function main() {
             .map((option) => ({ ...option, description: safeMessage(option.description) })),
         })),
         reasoningEfforts: [...REASONING_EFFORTS],
-        avatarPresets: [...AVATAR_PRESET_IDS],
       },
       limits: { ...SETTINGS_LIMITS },
+      rateLimits: sanitizeRateLimits(codexSnap.rateLimits),
     };
   };
   const runtimeDefaults = () => ({
-    model: monitorCodexOverride?.model ?? config.model,
-    settingsModel: monitorCodexOverride?.model,
-    reasoningEffort: monitorCodexOverride?.reasoningEffort ?? config.reasoningEffort,
+    model: codexConfigOverride?.model ?? config.model,
+    settingsModel: codexConfigOverride?.model,
+    reasoningEffort: codexConfigOverride?.reasoningEffort ?? config.reasoningEffort,
   });
   const allowedEffortsSet = () => new Set([
     ...REASONING_EFFORTS,
     ...codexSnap.models.flatMap((model) => model.supportedReasoningEfforts.map((entry) => entry.reasoningEffort))
       .filter((effort) => REASONING_EFFORT_PATTERN.test(effort)),
   ]);
-  const cursorEpoch = randomUUID();
-  let monitorHtmlCache;
+  let settingsHtmlCache;
 
   const store = await openCodexSessionStore({
     file: config.storePath,
@@ -1108,7 +1062,6 @@ async function main() {
     logError,
   });
   diskJobs.sweep();
-  const transcriptStore = createTranscriptStore(resolveIsolatedTranscriptsDir(config.storePath), { logError });
 
   const warmPool = createWarmCodexPool({
     idleMs: config.warmIdleMs,
@@ -1117,45 +1070,33 @@ async function main() {
   const updateSettings = async (args, signal) => {
     await syncPromise;
     signal.throwIfAborted();
-    validateSettingsPatch(args, allowedEffortsSet());
-    if (args.reset === true) {
+    const { reset, codex } = validateCodexSettingsPatch(args, allowedEffortsSet());
+    if (reset === true) {
       const receipt = await writeCodexUserConfig({ ...codexConfigOptions(signal), model: null, reasoningEffort: null });
-      monitorCodexOverride = null;
+      codexConfigOverride = null;
       codexSnap = { ...codexSnap, synced: false, overridden: receipt.overridden, overriddenMessage: receipt.overriddenMessage };
-      try {
-        settingsStore.update({ reset: true });
-      } finally {
-        await warmPool.evictAll();
-        await syncCodexSnapshot(signal);
-      }
+      await warmPool.evictAll();
+      await syncCodexSnapshot(signal);
       return;
     }
 
-    if (args.codex !== undefined) {
-      const nextModel = Object.hasOwn(args.codex, 'model') ? (args.codex.model?.trim() || null) : undefined;
-      const nextEffort = Object.hasOwn(args.codex, 'reasoningEffort') ? (args.codex.reasoningEffort?.trim() || null) : undefined;
-      if (!codexSnap.synced
-        || (nextModel !== undefined && nextModel !== codexSnap.model)
-        || (nextEffort !== undefined && nextEffort !== codexSnap.reasoningEffort)) {
-        const receipt = await writeCodexUserConfig({ ...codexConfigOptions(signal), model: nextModel, reasoningEffort: nextEffort });
-        const { model, reasoningEffort, overridden, overriddenMessage } = receipt;
-        const matchedModel = codexSnap.models.find((entry) => entry.model.toLowerCase()
-          === (model ?? codexSnap.catalogDefaultModel ?? '').toLowerCase());
-        codexSnap = {
-          ...codexSnap, synced: true, model, reasoningEffort, overridden, overriddenMessage, error: null,
-          catalogDefaultReasoningEffort: matchedModel?.defaultReasoningEffort ?? null,
-        };
-        monitorCodexOverride = { model: model ?? undefined, reasoningEffort: reasoningEffort ?? undefined };
-        await warmPool.evictAll();
-      }
-    }
-    const legacy = settingsStore.get().codex;
-    if (args.roles !== undefined || legacy.model !== null || legacy.reasoningEffort !== null) {
-      settingsStore.update({
-        ...(args.roles !== undefined ? { roles: args.roles } : {}),
-        codex: { model: null, reasoningEffort: null },
-      });
-    }
+    if (codex === undefined) return;
+    const { model: nextModel, reasoningEffort: nextEffort } = codex;
+    if (codexSnap.synced
+      && (nextModel === undefined || nextModel === codexSnap.model)
+      && (nextEffort === undefined || nextEffort === codexSnap.reasoningEffort)) return;
+
+    const { model, reasoningEffort, overridden, overriddenMessage } = await writeCodexUserConfig({
+      ...codexConfigOptions(signal), model: nextModel, reasoningEffort: nextEffort,
+    });
+    const matchedModel = codexSnap.models.find((entry) => entry.model.toLowerCase()
+      === (model ?? codexSnap.catalogDefaultModel ?? '').toLowerCase());
+    codexSnap = {
+      ...codexSnap, synced: true, model, reasoningEffort, overridden, overriddenMessage, error: null,
+      catalogDefaultReasoningEffort: matchedModel?.defaultReasoningEffort ?? null,
+    };
+    codexConfigOverride = { model, reasoningEffort };
+    await warmPool.evictAll();
   };
 
   const makeArchiveFn = (fallbackCwd, signal) => async ({ threadId, cwd: entryCwd }, callSignal) => {
@@ -1222,100 +1163,6 @@ async function main() {
   let shuttingDown = false;
   let shutdownPromise;
 
-  const protectedConversations = () => [...jobs.values()].filter((job) => !job.settled).map((job) => job.conversationId);
-
-  const ensureJobConversation = (job) => transcriptStore.ensureConversation(job.conversationId, {
-    title: job.description, sessionKey: job.conversationSessionKey ?? null, threadId: job.threadId ?? null,
-    cwd: job.cwd, model: job.model, status: 'running',
-  }, protectedConversations());
-
-  const recordJobEvent = (job, event, options) => {
-    if (!transcriptStore.hasConversation(job.conversationId)) ensureJobConversation(job);
-    return transcriptStore.appendEvent(job.conversationId, { jobId: job.id, turnId: job.turnId, ...event }, options);
-  };
-
-  const finalizeJobStreams = (job) => {
-    transcriptStore.finalizeStreams(job.conversationId, { jobId: job.id }, { immediate: true });
-  };
-
-  const recordDelegation = (job, validated) => {
-    ensureJobConversation(job);
-    transcriptStore.updateMeta(job.conversationId, {
-      status: 'running', threadId: job.threadId, model: job.model,
-    });
-    recordJobEvent(job, {
-      type: 'delegation',
-      action: validated.action,
-      description: job.description,
-      prompt: validated.prompt,
-      ...(validated.sandbox ? { sandbox: validated.sandbox } : {}),
-      ...(validated.permissionMode ? { permissionMode: validated.permissionMode } : {}),
-      ...(validated.reasoningEffort ? { reasoningEffort: validated.reasoningEffort } : {}),
-      ...(job.model ? { model: job.model } : {}),
-      ...(Array.isArray(validated.images) && validated.images.length > 0 ? { imageCount: validated.images.length } : {}),
-      ...(validated.outputSchema ? { hasOutputSchema: true } : {}),
-    });
-  };
-
-  const recordDiagnostic = (job, event) => {
-    recordJobTelemetry(job, event);
-    const id = job.conversationId;
-    const { threadId, turnId, itemId } = event;
-    switch (event.type) {
-      case 'turnStarted': {
-        if (job.transcriptTurnId === turnId) break;
-        job.transcriptTurnId = turnId;
-        job.selectedAnswerItemId = undefined;
-        const conversation = ensureJobConversation(job);
-        transcriptStore.updateMeta(id, { threadId, turnCount: conversation.turnCount + 1 });
-        break;
-      }
-      case 'streamDelta':
-        if (job.settled || job.controller.signal.aborted) break;
-        if (!transcriptStore.hasConversation(id)) ensureJobConversation(job);
-        transcriptStore.upsertStreamEvent(id, { jobId: job.id, turnId, channel: event.channel, itemId, delta: event.delta });
-        break;
-      case 'planUpdated': {
-        const plan = { explanation: event.explanation, steps: event.steps };
-        transcriptStore.updateMeta(id, { latestPlan: plan });
-        recordJobEvent(job, { type: 'plan', turnId, ...plan });
-        break;
-      }
-      case 'diffUpdated':
-        transcriptStore.updateMeta(id, { latestDiffSummary: { filesChangedCount: event.filesChangedCount, files: event.files } });
-        break;
-      case 'diffDetail': {
-        const summary = { filesChangedCount: event.filesChangedCount, files: event.files };
-        transcriptStore.updateMeta(id, { latestDiffSummary: summary });
-        recordJobEvent(job, { type: 'diff', turnId, ...summary, diff: event.diff, truncated: event.truncated });
-        break;
-      }
-      case 'activityDetail': {
-        const hasText = typeof event.summary?.text === 'string' && Boolean(event.summary.text.trim());
-        if (event.kind === 'reasoning' && !hasText) break;
-        const activity = recordJobEvent(job, { type: 'activity', turnId, itemId, kind: event.kind, phase: event.phase, summary: event.summary });
-        if (event.kind === 'commentary' && event.phase === 'completed' && hasText) {
-          transcriptStore.finalizeStreams(id, { jobId: job.id, turnId, channel: 'agentMessage', itemId },
-            { superseded: true, supersededBy: activity.eventId });
-        }
-        break;
-      }
-      case 'itemCompleted': {
-        const channel = Object.hasOwn(STREAM_CHANNEL_BY_ITEM_TYPE, event.itemType) ? STREAM_CHANNEL_BY_ITEM_TYPE[event.itemType] : null;
-        if (channel) transcriptStore.finalizeStreams(id, { jobId: job.id, turnId, channel, itemId });
-        break;
-      }
-      case 'answerItemSelected':
-        job.selectedAnswerItemId = itemId;
-        break;
-      case 'tokenUsage':
-        if (job.tokenUsage) transcriptStore.updateMeta(id, { tokenUsage: job.tokenUsage });
-        break;
-      default:
-        break;
-    }
-  };
-
   const trackOp = (promise) => {
     inFlightOps.add(promise);
     const cleanup = () => inFlightOps.delete(promise);
@@ -1348,12 +1195,11 @@ async function main() {
 
   const persistJobReceiptIfUnclaimed = (job) => {
     if (job.persistedToDisk) return true;
-    if (!job.settled || job.claimed || job.uiOwned || !job.publishedRunning) return true;
+    if (!job.settled || job.claimed || !job.publishedRunning) return true;
     const settledAt = job.settledAt ?? Date.now();
     const ok = diskJobs.writeJob({
       version: 1,
       jobId: job.id,
-      conversationId: job.conversationId,
       startedAt: job.startedAt,
       settledAt,
       expiresAt: settledAt + JOB_TTL_MS,
@@ -1486,21 +1332,13 @@ async function main() {
     };
   };
 
-  const createJobRecord = (validated, uiOwned = false, rt = runtimeDefaults()) => {
+  const createJobRecord = (validated) => {
     const jobId = randomUUID();
     const jobController = new AbortController();
     const nowMs = Date.now();
     const nowMono = performance.now();
-    const owned = store.list().find((row) => row.threadId === validated.threadId
-      && path.relative(row.cwd, validated.cwd) === '');
-    const conversationSessionKey = validated.sessionKey ?? owned?.sessionKey;
     return {
       id: jobId,
-      conversationId: canonicalConversationId({ sessionKey: conversationSessionKey, threadId: validated.threadId, jobId }),
-      conversationSessionKey,
-      model: validated.explicitModel ?? rt.settingsModel ?? owned?.model ?? config.model ?? null,
-      action: validated.action,
-      uiOwned,
       description: validated.description,
       sessionKey: validated.sessionKey,
       threadId: validated.threadId,
@@ -1529,25 +1367,6 @@ async function main() {
     };
   };
 
-  const recordJobCompletion = (job) => {
-    ensureJobConversation(job);
-    const text = formatTextOutput(job.result.content);
-    const row = store.list().find((entry) => entry.threadId === job.threadId);
-    const status = row?.state ?? (job.controller.signal.aborted ? 'cancelled' : job.result.isError ? 'failed' : 'completed');
-    transcriptStore.updateMeta(job.conversationId, {
-      status, threadId: job.threadId, model: row?.model ?? job.model, lastPreview: redactSecrets(text).slice(0, 2000),
-    });
-    const terminal = recordJobEvent(job, {
-      type: job.action === 'compact' ? 'compact' : 'answer', text, isError: Boolean(job.result.isError),
-    }, { immediate: false });
-    if (terminal && job.action !== 'compact' && !job.result.isError) {
-      transcriptStore.supersedeAnswerStreams(job.conversationId, {
-        jobId: job.id, turnId: job.turnId, itemId: job.selectedAnswerItemId, answer: terminal, text,
-      });
-    }
-    finalizeJobStreams(job);
-  };
-
   const attachJobCompletion = (job, runPromise) => {
     job.done = runPromise.then((finalResult) => {
       job.settled = true;
@@ -1555,7 +1374,6 @@ async function main() {
       job.result = finalResult;
       job.activeActivities.clear();
       job.activeRun = null;
-      recordJobCompletion(job);
       persistJobReceiptIfUnclaimed(job);
       if (jobs.has(job.id) && !job.claimed && job.expiryTimer === undefined) {
         job.expiryTimer = setTimeout(() => {
@@ -1571,9 +1389,8 @@ async function main() {
   };
 
   const startBackgroundCodexJob = (validated, rt = runtimeDefaults()) => {
-    const job = createJobRecord(validated, false, rt);
+    const job = createJobRecord(validated);
     const jobController = job.controller;
-    recordDelegation(job, validated);
 
     const runPromise = (async () => {
       const hasSelector = validated.sessionKey !== undefined || validated.threadId !== undefined;
@@ -1650,10 +1467,9 @@ async function main() {
               lease,
               onThreadKnown: (knownId) => {
                 job.threadId = knownId;
-                transcriptStore.updateMeta(job.conversationId, { threadId: knownId });
               },
               onDiagnostic: (event) => {
-                recordDiagnostic(job, event);
+                recordJobTelemetry(job, event);
               },
               onError: (err, stopReason) => {
                 logError(`child run failed (${stopReason}): ${err?.message ?? err}`);
@@ -1723,10 +1539,9 @@ async function main() {
     return attachJobCompletion(job, runPromise);
   };
 
-  const startBackgroundCompactJob = (validated, uiOwned = false, rt = runtimeDefaults()) => {
-    const job = createJobRecord(validated, uiOwned, rt);
+  const startCompactJob = (validated, rt = runtimeDefaults()) => {
+    const job = createJobRecord(validated);
     const jobController = job.controller;
-    recordDelegation(job, validated);
 
     const runPromise = (async () => {
       let lease;
@@ -1787,7 +1602,7 @@ async function main() {
             turnTimeoutMs: config.turnTimeoutMs,
             lease,
             onDiagnostic: (event) => {
-              recordDiagnostic(job, event);
+              recordJobTelemetry(job, event);
             },
             onError: (err, stopReason) => {
               logError(`compact run failed (${stopReason}): ${err?.message ?? err}`);
@@ -1853,13 +1668,7 @@ async function main() {
     if (ownedRow.active) {
       throw new CodexSessionError(CODEX_ERROR_CODES.BUSY, `subagent-codex: thread "${ownedRow.threadId}" has an active run and cannot be closed`);
     }
-    const receipt = await store.close(selector, makeArchiveFn(selector.cwd, requestSignal));
-    const id = canonicalConversationId(receipt);
-    transcriptStore.ensureConversation(id, { ...ownedRow, title: ownedRow.sessionKey ?? ownedRow.threadId }, protectedConversations());
-    transcriptStore.finalizeStreams(id, {}, { immediate: true });
-    transcriptStore.updateMeta(id, { status: 'closed' });
-    transcriptStore.appendEvent(id, { type: 'closed', threadId: receipt.threadId });
-    return receipt;
+    return store.close(selector, makeArchiveFn(selector.cwd, requestSignal));
   })());
 
   const forkOwnedThread = (validated, requestSignal, rt = runtimeDefaults()) => trackOp((async () => {
@@ -1907,12 +1716,6 @@ async function main() {
         requestTimeoutMs: config.requestTimeoutMs,
         lease,
       });
-      const row = store.list().find((entry) => entry.threadId === receipt.threadId);
-      const id = canonicalConversationId({ sessionKey: validated.targetSessionKey });
-      const meta = { ...row, sessionKey: validated.targetSessionKey, threadId: receipt.threadId, cwd: validated.cwd, status: 'ready' };
-      transcriptStore.ensureConversation(id, { ...meta, title: validated.targetSessionKey }, protectedConversations());
-      transcriptStore.updateMeta(id, meta);
-      transcriptStore.appendEvent(id, { type: 'fork', threadId: receipt.threadId, sourceThreadId: lease.sourceThreadId });
       return receipt;
     } catch (error) {
       lease.release?.();
@@ -1943,7 +1746,7 @@ async function main() {
 
     const job =
       validated.action === 'compact'
-        ? startBackgroundCompactJob(validated, false, rt)
+        ? startCompactJob(validated, rt)
         : startBackgroundCodexJob(validated, rt);
 
     const detachProgress = attachProgressListener(job, progressToken);
@@ -1993,19 +1796,9 @@ async function main() {
         };
       }
 
-      const diskJob = validated.cancel
-        ? diskJobs.listUnclaimed(new Set(), { includeConversationId: true, bypassCache: true }).find((entry) => entry.jobId === validated.jobId)
-        : undefined;
       const diskResult = diskJobs.claimJobFromDisk(validated.jobId);
       if (diskResult) {
         if (validated.cancel) {
-          if (diskJob) {
-            const conversationId = conversationIdForDiskJob(diskJob, indexSessionRows(store.list()));
-            if (transcriptStore.hasConversation(conversationId)) {
-              transcriptStore.finalizeStreams(conversationId, { jobId: validated.jobId }, { immediate: true });
-              transcriptStore.appendEvent(conversationId, { type: 'cancel', source: 'model', jobId: validated.jobId });
-            }
-          }
           return {
             content: [
               {
@@ -2025,9 +1818,7 @@ async function main() {
 
     if (validated.cancel) {
       job.controller.abort(new Error('Cancelled via subagent_codex_wait'));
-      finalizeJobStreams(job);
       await Promise.race([job.done, delay(5_000).catch(() => {})]);
-      recordJobEvent(job, { type: 'cancel', source: 'model' });
       claimJob(job);
       return {
         content: [
@@ -2062,8 +1853,7 @@ async function main() {
         { type: 'text', text: validated.steer },
         ...steerImages.map((imagePath) => ({ type: 'localImage', path: imagePath })),
       ];
-      const receipt = await job.activeRun.steer(steerBlocks, { signal: requestSignal });
-      recordJobEvent(job, { type: 'steer', turnId: receipt.turnId, source: 'model', text: validated.steer });
+      await job.activeRun.steer(steerBlocks, { signal: requestSignal });
     }
 
     const detachProgress = attachProgressListener(job, progressToken);
@@ -2118,285 +1908,6 @@ async function main() {
     };
   };
 
-  const indexSessionRows = (rows) => new Map(rows.map((row) => [row.threadId, row]));
-
-  const conversationIdForDiskJob = (job, rowsByThreadId) => job.conversationId ?? canonicalConversationId({
-    sessionKey: job.sessionKey ?? rowsByThreadId.get(job.threadId)?.sessionKey,
-    threadId: job.threadId, jobId: job.jobId,
-  });
-
-  const monitorStatusRank = (status) => {
-    if (status === 'running') return 0;
-    if (status === 'completed_unclaimed') return 1;
-    if (status === 'ready' || status === 'uncertain') return 2;
-    return 3;
-  };
-
-  const monitorInventory = () => {
-    const rows = store.list();
-    const rowsByThreadId = indexSessionRows(rows);
-    const conversations = new Map(transcriptStore.listConversations().map((conv) => [conv.conversationId, conv]));
-    const latestJobs = new Map();
-    const disk = diskJobs.listUnclaimed(new Set(jobs.keys()), { includeConversationId: true });
-    const merge = (id, meta) => {
-      const existing = conversations.get(id);
-      const updatedAt = existing?.updatedAt && existing.updatedAt > meta.updatedAt ? existing.updatedAt : meta.updatedAt;
-      conversations.set(id, {
-        version: 1, conversationId: id, kind: id.startsWith('ephemeral:') ? 'ephemeral' : 'session',
-        model: null, turnCount: 0, tokenUsage: null, latestPlan: null, latestDiffSummary: null, lastPreview: null, nextSeq: 0,
-        createdAt: meta.updatedAt, ...existing, ...meta, updatedAt,
-      });
-    };
-    for (const [id, conv] of conversations) {
-      if (conv.status === 'running') conversations.set(id, { ...conv, status: 'interrupted' });
-    }
-    for (const row of rows) {
-      const id = canonicalConversationId(row);
-      const tokenUsage = !conversations.get(id)?.tokenUsage && typeof row.used === 'number'
-        ? {
-            totalTokens: row.used,
-            modelContextWindow: typeof row.contextWindow === 'number' ? row.contextWindow : null,
-            utilizationPct: typeof row.contextWindow === 'number' && row.contextWindow > 0
-              ? Math.floor((row.used / row.contextWindow) * 1000 + 1e-9) / 10
-              : null,
-          }
-        : undefined;
-      merge(id, {
-        title: conversations.get(id)?.title ?? redactSecrets(row.sessionKey ?? row.threadId),
-        sessionKey: row.sessionKey ?? null, threadId: row.threadId, cwd: row.cwd,
-        model: row.model ? redactSecrets(row.model) : null, status: row.active ? 'running' : row.state,
-        ...(tokenUsage ? { tokenUsage } : {}),
-        updatedAt: row.lastUsedAt,
-      });
-    }
-    const mergeJob = (id, job, status, updatedAt) => {
-      const existing = conversations.get(id);
-      const chosen = latestJobs.get(id);
-      if (chosen && (monitorStatusRank(chosen.status) < monitorStatusRank(status)
-        || (chosen.status === status && chosen.updatedAt > updatedAt))) return;
-      latestJobs.set(id, { jobId: job.id ?? job.jobId, status, updatedAt });
-      merge(id, {
-        title: existing?.title ?? redactSecrets(job.description || id),
-        sessionKey: job.conversationSessionKey ?? job.sessionKey ?? existing?.sessionKey ?? null,
-        threadId: job.threadId ?? existing?.threadId ?? null, cwd: job.cwd, updatedAt,
-        status: existing?.status === 'running' && status !== 'running' ? 'running' : status,
-        jobId: job.id ?? job.jobId,
-      });
-    };
-    for (const job of disk) {
-      const id = conversationIdForDiskJob(job, rowsByThreadId);
-      mergeJob(id, job, job.status, job.settledAt ?? job.expiresAt);
-    }
-    for (const job of jobs.values()) {
-      mergeJob(job.conversationId, job, job.settled ? 'completed_unclaimed' : 'running', new Date(job.settledAt ?? job.startedAt).toISOString());
-    }
-    return { conversations, latestJobs, rows, rowsByThreadId, disk };
-  };
-
-  const sortedMonitorConversations = ({ conversations }) => [...conversations.values()].sort((left, right) =>
-    monitorStatusRank(left.status) - monitorStatusRank(right.status) || Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
-
-  const buildMonitorPage = (inventory, conversationId, {
-    afterSeq = 0, limit = 200, reset = false, snapshot = false, maxBytes = MAX_UI_RESPONSE_BYTES, wrap = uiResult,
-  } = {}) => {
-    const conversation = inventory.conversations.get(conversationId);
-    if (!conversation) return null;
-    const stored = transcriptStore.getConversation(conversationId, { afterSeq, limit });
-    const available = stored?.events ?? [];
-    const job = jobs.get(inventory.latestJobs.get(conversationId)?.jobId);
-    const liveJob = job ? {
-      jobId: job.id, description: redactSecrets(job.description), status: job.settled ? 'completed_unclaimed' : 'running',
-      elapsedMs: Math.max(0, (job.settledAt ?? Date.now()) - job.startedAt), startedAt: new Date(job.startedAt).toISOString(),
-      telemetry: snapshotTelemetry(job), steerable: Boolean(typeof job.activeRun?.steer === 'function' && !job.settled),
-    } : null;
-    const payload = {
-      conversation, events: [], nextSeq: stored?.nextSeq ?? afterSeq, hasMore: false,
-      truncated: false, liveJob, cursorEpoch, reset, ...(snapshot ? {} : { fileLinks: [] }),
-    };
-    // Reserve space for the longest cursor and boolean values before adding each event once.
-    const envelopeBytes = () => jsonBytes(wrap({ ...payload, truncated: false }));
-    const firstBytes = available.length ? jsonBytes(available[0]) : 0;
-    const firstBudget = !snapshot && firstBytes < maxBytes ? firstBytes : 0;
-    let bytes = envelopeBytes();
-    if (bytes + firstBudget > maxBytes) {
-      payload.conversation = { ...conversation, latestPlan: null, latestDiffSummary: null };
-      payload.truncated = true;
-      bytes = envelopeBytes();
-    }
-    if (bytes + firstBudget > maxBytes && payload.liveJob?.telemetry) {
-      payload.liveJob = { ...payload.liveJob, telemetry: null };
-      bytes = envelopeBytes();
-    }
-    if (bytes + firstBudget > maxBytes) {
-      payload.conversation = { ...payload.conversation, title: '', lastPreview: null };
-      if (payload.liveJob) payload.liveJob = { ...payload.liveJob, description: '' };
-      bytes = envelopeBytes();
-    }
-    if (bytes > maxBytes) {
-      if (snapshot) return null;
-      throw new Error('codex_ui_get_conversation: conversation metadata exceeds response limit');
-    }
-
-    for (const event of available) {
-      const eventBytes = payload.events.length ? jsonBytes(event) + 1 : firstBytes;
-      if (bytes + eventBytes > maxBytes) {
-        payload.truncated = true;
-        break;
-      }
-      payload.events.push(event);
-      bytes += eventBytes;
-    }
-    if (!snapshot && available.length && !payload.events.length) {
-      const { seq, eventId, at, type, jobId, turnId, channel, itemId, startedAt, done, superseded, supersededBy } = available[0];
-      const placeholder = {
-        seq, eventId, at, type, jobId, turnId, channel, itemId, startedAt, done, superseded, supersededBy,
-        truncated: true, detailOmitted: true,
-      };
-      const placeholderBytes = jsonBytes(placeholder);
-      if (bytes + placeholderBytes > maxBytes) throw new Error('codex_ui_get_conversation: event metadata exceeds response limit');
-      payload.events.push(placeholder);
-      bytes += placeholderBytes;
-    }
-    payload.hasMore = Boolean(stored?.hasMore || payload.events.length < available.length);
-    if (payload.hasMore) payload.nextSeq = payload.events.at(-1)?.seq ?? afterSeq;
-    if (!snapshot) {
-      const candidates = monitorFileCandidates(payload.conversation, payload.events);
-      const resolveFile = candidates.size ? safeFileLinkResolver(payload.conversation.cwd) : null;
-      for (const file of candidates) {
-        const link = resolveFile(file);
-        if (!link) continue;
-        const linkBytes = jsonBytes(link) + (payload.fileLinks.length ? 1 : 0);
-        if (bytes + linkBytes > maxBytes) continue;
-        payload.fileLinks.push(link);
-        bytes += linkBytes;
-      }
-    }
-    return payload;
-  };
-
-  const buildInitialSnapshot = (inventory, sorted, initialConversationId, wrapSnapshot) => {
-    const conversations = [];
-    let bytes = 2; // The JSON array brackets.
-    for (const row of sorted) {
-      if (conversations.length >= MAX_SNAPSHOT_CONVERSATIONS) break;
-      const summary = {
-        ...row, latestPlan: null, latestDiffSummary: null,
-        title: row.title.slice(0, 512), lastPreview: row.lastPreview?.slice(0, 512) ?? null,
-      };
-      const size = jsonBytes(summary) + (conversations.length ? 1 : 0);
-      if (bytes + size > MAX_SNAPSHOT_LIST_BYTES) break;
-      conversations.push(summary);
-      bytes += size;
-    }
-    const snapshot = { conversations, hasMoreConversations: conversations.length < sorted.length, initialConversation: null };
-    if (jsonBytes(wrapSnapshot(snapshot)) > MAX_SNAPSHOT_BYTES) {
-      throw new Error('Codex Monitor snapshot metadata exceeds response limit');
-    }
-    const target = initialConversationId ?? conversations[0]?.conversationId;
-    if (target) {
-      snapshot.initialConversation = buildMonitorPage(inventory, target, {
-        snapshot: true, maxBytes: MAX_SNAPSHOT_BYTES,
-        wrap: (page) => wrapSnapshot({ ...snapshot, initialConversation: page }),
-      });
-    }
-    return snapshot;
-  };
-
-  const handleMonitorOpen = ({ conversationId, sessionKey, jobId }) => {
-    const inventory = monitorInventory();
-    const { conversations, rows, rowsByThreadId, disk } = inventory;
-    const diskJob = jobId && disk.find((job) => job.jobId === jobId);
-    const initialConversationId = conversationId ?? (sessionKey ? canonicalConversationId({ sessionKey }) : undefined)
-      ?? (jobId ? jobs.get(jobId)?.conversationId : undefined)
-      ?? (diskJob ? conversationIdForDiskJob(diskJob, rowsByThreadId) : null);
-    const counts = { running: [...jobs.values()].filter((job) => !job.settled).length, sessions: rows.length, total: conversations.size };
-    const wrap = (initialSnapshot) => uiResult({
-      serverVersion: SERVER_VERSION, cursorEpoch, initialConversationId, counts, initialSnapshot,
-    }, 'Codex Subagent Monitor');
-    return wrap(buildInitialSnapshot(inventory, sortedMonitorConversations(inventory), initialConversationId, wrap));
-  };
-
-  const handleMonitorList = ({ include, conversationId }) => {
-    const inventory = monitorInventory();
-    const conversations = sortedMonitorConversations(inventory);
-    const meta = { serverVersion: SERVER_VERSION, cursorEpoch, now: new Date().toISOString() };
-    if (include !== 'initialConversation') return uiResult({ conversations, ...meta, hasMoreConversations: false });
-    const target = inventory.conversations.has(conversationId) ? conversationId : null;
-    const wrap = (snapshot) => uiResult({ ...meta, ...snapshot });
-    return wrap(buildInitialSnapshot(inventory, conversations, target, wrap));
-  };
-
-  const handleMonitorGet = ({ conversationId, afterSeq = 0, limit = 200, cursorEpoch: clientEpoch }) => {
-    const reset = clientEpoch !== undefined && clientEpoch !== cursorEpoch && afterSeq > 0;
-    const page = buildMonitorPage(monitorInventory(), conversationId, { afterSeq: reset ? 0 : afterSeq, limit, reset });
-    if (!page) throw new Error('codex_ui_get_conversation: conversation not found');
-    return uiResult(page);
-  };
-
-  const handleMonitorSteer = async ({ jobId, steer }, signal) => {
-    const job = jobs.get(jobId);
-    if (!job || job.settled || typeof job.activeRun?.steer !== 'function') {
-      throw new Error(`codex_ui_steer: job ${jobId} is not in an active steerable turn`);
-    }
-    const { turnId } = await job.activeRun.steer([{ type: 'text', text: steer }], { signal });
-    recordJobEvent(job, { type: 'steer', turnId, source: 'user_ui', text: steer });
-    return uiResult({ ok: true, jobId, turnId });
-  };
-
-  const handleMonitorAction = async ({ action, jobId, sessionKey, threadId, targetSessionKey, conversationId }, signal) => {
-    if (action === 'cancel') {
-      const job = jobId && jobs.get(jobId);
-      if (!job) throw new Error('codex_ui_action: cancel requires an in-memory jobId');
-      job.controller.abort(new Error('Cancelled from Codex Monitor UI'));
-      finalizeJobStreams(job);
-      await Promise.race([job.done, delay(5_000).catch(() => {})]);
-      recordJobEvent(job, { type: 'cancel', source: 'user_ui' });
-      if (job.uiOwned && job.settled) claimJob(job);
-      return uiResult({ ok: true, action, jobId, settled: job.settled });
-    }
-    const rows = store.list();
-    if (action === 'clear_history') {
-      if (!conversationId) throw new Error('codex_ui_action: clear_history requires conversationId');
-      const rowsByThreadId = indexSessionRows(rows);
-      if ([...jobs.values()].some((job) => job.conversationId === conversationId)
-        || diskJobs.listUnclaimed(new Set(), { includeConversationId: true, bypassCache: true })
-          .some((job) => conversationIdForDiskJob(job, rowsByThreadId) === conversationId)
-        || rows.some((row) => canonicalConversationId(row) === conversationId)) {
-        throw new Error('codex_ui_action: cannot clear history for an open session or a running or unclaimed job');
-      }
-      if (!transcriptStore.deleteConversation(conversationId)) throw new Error('codex_ui_action: could not delete history');
-      return uiResult({ ok: true, action, deleted: true, conversationId });
-    }
-    if (!sessionKey && !threadId) throw new Error(`codex_ui_action: ${action} requires sessionKey or threadId`);
-    const row = rows.find((entry) => (!sessionKey || entry.sessionKey === sessionKey) && (!threadId || entry.threadId === threadId));
-    if (!row) throw new Error('codex_ui_action: owned session not found');
-    if (row.active || row.state === 'closing') throw new Error('codex_ui_action: session already has an active operation');
-    const selector = { sessionKey: row.sessionKey, threadId: row.threadId, cwd: row.cwd };
-    if (action === 'close') {
-      const receipt = await closeOwnedThread(selector, signal);
-      return uiResult({ ok: true, action, closed: true, sessionKey: row.sessionKey ?? null, threadId: receipt.threadId });
-    }
-    const rt = runtimeDefaults();
-    const defaults = {
-      ...selector, action, permissionMode: config.permissionMode, sandbox: config.sandbox,
-      model: rt.model, reasoningEffort: rt.reasoningEffort, waitMs: config.waitMs,
-    };
-    if (action === 'fork') {
-      if (!targetSessionKey) throw new Error('codex_ui_action: fork requires targetSessionKey');
-      validateSessionKey(targetSessionKey);
-      const receipt = await forkOwnedThread({ ...defaults, targetSessionKey }, signal, rt);
-      return uiResult({ ok: true, action, sessionKey: targetSessionKey, threadId: receipt.threadId, sourceThreadId: row.threadId });
-    }
-    const job = startBackgroundCompactJob({ ...defaults, description: 'Compact from Codex Monitor', prompt: '' }, true, rt);
-    job.done.then(() => { if (!job.claimed) claimJob(job); });
-    await Promise.race([job.done, delay(2500)]);
-    if (job.settled && job.result.isError) {
-      return uiResult({ ok: false, action, jobId: job.id, error: redactSecrets(formatTextOutput(job.result.content)) }, undefined, true);
-    }
-    return uiResult({ ok: true, action, status: job.settled ? 'completed' : 'running', jobId: job.id,
-      sessionKey: row.sessionKey ?? null, threadId: row.threadId });
-  };
-
   const handleRequest = async (message) => {
     const { id, method, params } = message;
     const isRequest = id !== undefined && id !== null;
@@ -2438,43 +1949,43 @@ async function main() {
     }
 
     if (method === 'resources/list') {
-      sendResult(id, { resources: [MONITOR_RESOURCE] });
+      sendResult(id, { resources: [SETTINGS_RESOURCE] });
       return;
     }
 
     if (method === 'resources/read') {
-      if (params?.uri !== MONITOR_RESOURCE_URI) {
-        sendError(id, -32602, 'Unknown monitor resource URI');
+      if (params?.uri !== SETTINGS_RESOURCE_URI) {
+        sendError(id, -32602, 'Unknown settings resource URI');
         return;
       }
       try {
-        const override = process.env.CODEX_MONITOR_HTML?.trim();
-        const monitorPath = path.resolve(override || path.join(pluginRoot, 'ui', 'dist', 'monitor.html'));
-        const file = statSync(monitorPath);
-        if (!file.isFile() || file.size > MAX_MONITOR_HTML_BYTES) throw new Error('Invalid monitor HTML file');
+        const override = process.env.CODEX_SETTINGS_HTML?.trim();
+        const settingsPath = path.resolve(override || path.join(pluginRoot, 'ui', 'dist', 'settings.html'));
+        const file = statSync(settingsPath);
+        if (!file.isFile() || file.size > MAX_SETTINGS_HTML_BYTES) throw new Error('Invalid settings HTML file');
         let html;
-        if (!override && monitorHtmlCache?.resolvedPath === monitorPath
-          && monitorHtmlCache.mtimeMs === file.mtimeMs && monitorHtmlCache.size === file.size) {
-          html = monitorHtmlCache.html;
+        if (!override && settingsHtmlCache?.resolvedPath === settingsPath
+          && settingsHtmlCache.mtimeMs === file.mtimeMs && settingsHtmlCache.size === file.size) {
+          html = settingsHtmlCache.html;
         } else {
-          if (!override) monitorHtmlCache = undefined;
-          html = readFileSync(monitorPath, 'utf8');
-          if (!html.trim() || Buffer.byteLength(html, 'utf8') > MAX_MONITOR_HTML_BYTES) {
-            throw new Error('Monitor HTML is empty or exceeds the size limit');
+          if (!override) settingsHtmlCache = undefined;
+          html = readFileSync(settingsPath, 'utf8');
+          if (!html.trim() || Buffer.byteLength(html, 'utf8') > MAX_SETTINGS_HTML_BYTES) {
+            throw new Error('Settings HTML is empty or exceeds the size limit');
           }
-          if (!override) monitorHtmlCache = { resolvedPath: monitorPath, mtimeMs: file.mtimeMs, size: file.size, html };
+          if (!override) settingsHtmlCache = { resolvedPath: settingsPath, mtimeMs: file.mtimeMs, size: file.size, html };
         }
-        sendResult(id, { contents: [{ uri: MONITOR_RESOURCE_URI, mimeType: MONITOR_RESOURCE_MIME, text: html, _meta: MONITOR_RESOURCE._meta }] });
+        sendResult(id, { contents: [{ uri: SETTINGS_RESOURCE_URI, mimeType: SETTINGS_RESOURCE_MIME, text: html, _meta: SETTINGS_RESOURCE._meta }] });
       } catch {
-        monitorHtmlCache = undefined;
-        sendError(id, -32603, 'Could not read monitor HTML: missing, empty, or exceeds the size limit');
+        settingsHtmlCache = undefined;
+        sendError(id, -32603, 'Could not read settings HTML: missing, empty, or exceeds the size limit');
       }
       return;
     }
 
     if (method === 'tools/list') {
       sendResult(id, {
-        tools: [SUBAGENT_CODEX_TOOL, SUBAGENT_CODEX_WAIT_TOOL, LIST_SESSIONS_TOOL, SUBAGENT_CODEX_MONITOR_TOOL, ...MONITOR_APP_TOOLS],
+        tools: [SUBAGENT_CODEX_TOOL, SUBAGENT_CODEX_WAIT_TOOL, LIST_SESSIONS_TOOL, SUBAGENT_CODEX_SETTINGS_TOOL, ...SETTINGS_APP_TOOLS],
       });
       return;
     }
@@ -2486,7 +1997,8 @@ async function main() {
         return;
       }
       const toolName = isPlainObject(params) ? params.name : undefined;
-      const toolArgs = isPlainObject(params) ? (params.arguments ?? {}) : {};
+      const rawArgs = isPlainObject(params) ? params.arguments : undefined;
+      const toolArgs = rawArgs ?? {};
       const meta = isPlainObject(params) && isPlainObject(params._meta) ? params._meta : undefined;
       const progressToken =
         meta && ((typeof meta.progressToken === 'string' && meta.progressToken.length > 0) || Number.isInteger(meta.progressToken))
@@ -2503,33 +2015,30 @@ async function main() {
           result = await handleSubagentCodexWait(toolArgs, controller.signal, progressToken);
         } else if (toolName === 'subagent_codex_list_sessions') {
           result = await handleListSessions(toolArgs);
-        } else if (toolName === SUBAGENT_CODEX_MONITOR_TOOL.name) {
-          validateMonitorArgs(toolArgs, SUBAGENT_CODEX_MONITOR_TOOL);
-          result = handleMonitorOpen(toolArgs);
-        } else {
-          const tool = MONITOR_APP_TOOLS.find((entry) => entry.name === toolName);
-          if (!tool) {
-            sendError(id, -32602, `Unknown tool: ${String(toolName)}`);
-            return;
+        } else if (toolName === SUBAGENT_CODEX_SETTINGS_TOOL.name) {
+          validateSettingsArgs(rawArgs === undefined ? {} : rawArgs, toolName, []);
+          result = uiResult({ serverVersion: SERVER_VERSION, ...buildSettingsPayload() }, 'Codex Subagent Settings');
+        } else if (toolName === 'codex_ui_get_settings') {
+          const args = rawArgs === undefined ? {} : rawArgs;
+          validateSettingsArgs(args, toolName, ['syncCodex']);
+          if (args.syncCodex !== undefined && typeof args.syncCodex !== 'boolean') {
+            throw new Error('codex_ui_get_settings: syncCodex must be a boolean');
           }
-          validateMonitorArgs(toolArgs, tool);
-          if (toolName === 'codex_ui_list_conversations') result = handleMonitorList(toolArgs);
-          else if (toolName === 'codex_ui_get_conversation') result = handleMonitorGet(toolArgs);
-          else if (toolName === 'codex_ui_steer') result = await handleMonitorSteer(toolArgs, controller.signal);
-          else if (toolName === 'codex_ui_get_settings') {
-            if (toolArgs.syncCodex !== false) {
-              await settingsUpdate;
-              await syncCodexSnapshot(controller.signal);
-            }
-            result = uiResult(buildSettingsPayload());
-          } else if (toolName === 'codex_ui_update_settings') {
-            const update = settingsUpdate.then(async () => {
-              await updateSettings(toolArgs, controller.signal);
-              return uiResult(buildSettingsPayload());
-            });
-            settingsUpdate = update.catch(() => {});
-            result = await update;
-          } else result = await handleMonitorAction(toolArgs, controller.signal);
+          if (args.syncCodex !== false) {
+            await settingsUpdate;
+            await syncCodexSnapshot(controller.signal);
+          }
+          result = uiResult(buildSettingsPayload());
+        } else if (toolName === 'codex_ui_update_settings') {
+          const update = settingsUpdate.then(async () => {
+            await updateSettings(rawArgs === undefined ? {} : rawArgs, controller.signal);
+            return uiResult(buildSettingsPayload());
+          });
+          settingsUpdate = update.catch(() => {});
+          result = await update;
+        } else {
+          sendError(id, -32602, 'Unknown tool: ' + String(toolName));
+          return;
         }
         sendResult(id, result);
       } catch (error) {
@@ -2570,7 +2079,6 @@ async function main() {
           persistJobReceiptIfUnclaimed(job);
         } else {
           job.controller.abort(new Error(`Server shutting down (${reason})`));
-          finalizeJobStreams(job);
         }
       }
       const runDisposeResults = await Promise.allSettled([...ownedRuns].map((run) => run.dispose()));
@@ -2596,7 +2104,6 @@ async function main() {
             isError: true,
             content: [{ type: 'text', text: `Codex run aborted during server shutdown (${reason})` }],
           };
-          finalizeJobStreams(job);
         }
         if (job.settled && job.publishedRunning && !job.claimed && !job.persistedToDisk) {
           const ok = await persistJobReceiptWithRetry(job);
@@ -2621,7 +2128,6 @@ async function main() {
         logError(`warm pool dispose error: ${err?.message ?? err}`);
       }
 
-      transcriptStore.flushAll();
       let storeOk = true;
       if (drained && runsOk && warmOk) {
         await store.dispose().catch((err) => {

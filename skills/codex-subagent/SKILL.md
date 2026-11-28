@@ -5,7 +5,7 @@ description: Delegate coding, debugging, review, or analysis tasks to an indepen
 
 # Codex Subagent (`subagent_codex`)
 
-This plugin exposes the `codex-subagent` engine (`0.5.0`) to Antigravity through the `codex-subagent` MCP server over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol, including a built-in Antigravity MCP App monitor UI (`ui://codex-subagent/monitor.html`).
+This plugin exposes the `codex-subagent` engine (`0.5.0`) to Antigravity through the `codex-subagent` MCP server over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol, including a built-in Antigravity MCP App settings panel (`ui://codex-subagent/settings.html`).
 
 ## Available Tools
 
@@ -24,13 +24,13 @@ Delegates a self-contained task to `@openai/codex` (`app-server --stdio`) and re
 - `action`: `"run"` (default), `"compact"` (compress long thread context in-place via `thread/compact/start`), `"fork"` (branch an existing thread into `targetSessionKey` via `thread/fork`), or `"close"` (archive in Codex and unregister).
 - `targetSessionKey` *(required when `action` is `"fork"`)*: New `sessionKey` to bind to the forked persistent thread.
 - `lastTurnId` *(optional when `action` is `"fork"`)*: Inclusive last `turnId` from the source thread to fork through.
-- `model`: Optional model override. On resumed turns without an explicit `model`, the session preserves its previous model; otherwise it falls back to `CODEX_MODEL` (inherits `~/.codex/config.toml` when `CODEX_MODEL` is unset).
+- `model`: Optional model override. On resumed turns without an explicit `model` (and no live settings panel override), the session preserves its previous model; otherwise it falls back to `CODEX_MODEL` env (or inherits `~/.codex/config.toml` when unset).
 - `permissionMode`: Optional approval/sandbox preset (`"never"`, `"read-only"`, `"approve-for-me"`, or `"dangerously-bypass-approvals-and-sandbox"`). `"read-only"` enforces `{ approvalPolicy: "never", sandbox: "read-only" }` fail-closed.
 - `sandbox`: Optional protocol-level sandbox override (`"read-only"`, `"workspace-write"`, `"danger-full-access"`). Can be changed turn-by-turn on a persistent `sessionKey`. Conflicts with `permissionMode: "read-only"` when set to a non-read-only value.
 - `images`: Optional array of up to 10 local image file paths (`.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`; `<= 20MB` each; absolute or relative to `cwd`) attached as `localImage` blocks alongside `prompt`.
 - `outputSchema`: Optional JSON Schema object (`<= 64KB`) passed to `turn/start` to constrain Codex's final output (valid only when `action` is `"run"`).
 - `waitMs`: Synchronous wait window in ms before returning `status: "running"` with a `jobId` and `telemetry` (default `120000`, clamped to `1000..150000`).
-- `reasoningEffort`: Optional reasoning effort override (`"low"`, `"medium"`, `"high"`, `"xhigh"`).
+- `reasoningEffort`: Optional reasoning effort override (`"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"ultra"`).
 
 ### 2. `subagent_codex_wait`
 
@@ -47,14 +47,9 @@ Continues waiting for, steers mid-turn, or cancels a background Codex job starte
 
 Takes `{}` and lists both persistent Codex threads (`sessions`, including `used` / `contextWindow`) and any running or unclaimed background jobs (`activeJobs`, including live `telemetry` with `phase`, `plan`, `diffSummary`, `idleMs`, `tokenUsage`, and `persisted: true` receipts recovered from disk).
 
-### 4. `subagent_codex_monitor`
+### 4. `subagent_codex_settings`
 
-Opens the built-in Antigravity **MCP App** Monitor UI (`ui://codex-subagent/monitor.html`), which is also directly launchable with `{}` from Antigravity's **Aux Pane `+` menu** (`Codex Monitor`) or the **left sidebar** (`Codex Subagent`). Shows real-time **Gemini ↔ Codex** conversation timelines, execution plans, thinking/command streams, clickable changed workspace files (`toggle-aux-pane`), context window bars, and direct UI controls (`Steer`, `Cancel`, `Compact`, `Fork`, `Close`, and `Clear History`).
-
-**Optional arguments:**
-- `conversationId`: Explicit monitor conversation ID (`session:<sessionKey>`, `thread:<threadId>`, or `ephemeral:<jobId>`).
-- `sessionKey`: Persistent session key to focus on.
-- `jobId`: Running or unclaimed background job ID to focus on.
+Opens the built-in Antigravity **MCP App** Codex Default Settings panel (`ui://codex-subagent/settings.html`), also directly launchable with `{}` from Antigravity's **left sidebar** (`Codex Subagent`). Reads and writes Codex global defaults (`~/.codex/config.toml`), dynamically syncs available models and per-model reasoning efforts (`model/list`), and displays live account usage quota bars (`account/rateLimits/read`, adapting to Plus 5-hour + weekly vs. Pro weekly-only plans). Takes no required arguments (`{}`).
 
 ## Usage Rules
 
@@ -76,4 +71,4 @@ Opens the built-in Antigravity **MCP App** Monitor UI (`ui://codex-subagent/moni
    - Resuming, compacting, forking, or closing a persistent session requires the same `cwd` that originally created it (`CODEX_THREAD_CWD_MISMATCH` otherwise).
    - When finished, call `subagent_codex` with `{ action: "close", cwd, sessionKey }` (or `threadId`).
 6. **Tool discovery:**
-   - Antigravity registers the plugin's MCP server as `codex-subagent_codex-subagent`. Call `subagent_codex`, `subagent_codex_wait`, `subagent_codex_list_sessions`, or `subagent_codex_monitor` via `call_mcp_tool` on `ServerName: "codex-subagent_codex-subagent"`.
+   - Antigravity registers the plugin's MCP server as `codex-subagent_codex-subagent`. Call `subagent_codex`, `subagent_codex_wait`, `subagent_codex_list_sessions`, or `subagent_codex_settings` via `call_mcp_tool` on `ServerName: "codex-subagent_codex-subagent"`.

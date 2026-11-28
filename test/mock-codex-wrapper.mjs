@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -125,6 +125,10 @@ async function sleep(ms) {
 
 async function handleRequest(msg) {
   const { id, method, params = {} } = msg;
+  const rpcLog = process.env.MOCK_CODEX_CONFIG_RPC_LOG;
+  if (rpcLog && ['initialize', 'config/read', 'config/batchWrite', 'model/list', 'account/rateLimits/read'].includes(method)) {
+    appendFileSync(rpcLog, JSON.stringify({ method, cursor: params.cursor ?? null }) + '\n');
+  }
 
   if (method === 'initialize') {
     sendResult(id, { userAgent: 'mock-codex/0.166.0', clientInfo: params.clientInfo ?? null });
@@ -142,7 +146,7 @@ async function handleRequest(msg) {
   }
 
   if (method === 'config/batchWrite') {
-    if (process.env.MOCK_CODEX_CONFIG_WRITE_FAIL === '1') {
+    if (process.env.MOCK_CODEX_CONFIG_WRITE_FAIL === '1' || existsSync(path.join(stateDir, 'reject-config-write'))) {
       sendError(id, -32603, 'mock config write error');
       return;
     }
@@ -174,6 +178,49 @@ async function handleRequest(msg) {
     const offset = Number(params.cursor ?? 0);
     const end = offset + (params.limit ?? 2);
     sendResult(id, { data: models.slice(offset, end), nextCursor: end < models.length ? String(end) : null });
+    return;
+  }
+
+  if (method === 'account/rateLimits/read') {
+    if (process.env.MOCK_CODEX_RATE_LIMITS_FAIL === '1' || existsSync(path.join(stateDir, 'reject-rate-limits'))) {
+      sendError(id, -32601, 'mock rate limits unavailable');
+      return;
+    }
+
+    const mockRateLimitsPath = path.join(stateDir, 'mock-rate-limits.json');
+    const mockJson = existsSync(mockRateLimitsPath)
+      ? readFileSync(mockRateLimitsPath, 'utf8') : process.env.MOCK_CODEX_RATE_LIMITS_JSON;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const defaultSnap = {
+      planType: 'plus',
+      ordinaryUsageAllowed: true,
+      primary: { usedPercent: 18, windowDurationMins: 300, resetsAt: nowSec + 15840 },
+      secondary: { usedPercent: 94, windowDurationMins: 10080, resetsAt: nowSec + 259200 },
+      credits: { hasCredits: false, unlimited: false, balance: '0' },
+      spendControlReached: false,
+      rateLimitReachedType: null,
+    };
+    const { rawEnvelope, ...snapshot } = (mockJson ? JSON.parse(mockJson) : null) ?? defaultSnap;
+    if (rawEnvelope === true) {
+      sendResult(id, snapshot);
+      return;
+    }
+
+    const { ordinaryUsageAllowed, ...bucket } = snapshot;
+    sendResult(id, {
+      ordinaryUsageAllowed: ordinaryUsageAllowed ?? null,
+      rateLimits: bucket,
+      rateLimitsByLimitId: { codex: bucket },
+      rateLimitResetCredits: {
+        availableCount: 1,
+        credits: [{
+          id: 'mock-reset-credit-1', resetType: 'codexRateLimits', status: 'available',
+          grantedAt: nowSec - 100, expiresAt: nowSec + 86400, title: 'Full reset', description: 'Mock reset credit',
+        }],
+      },
+      accountId: 'mock-account-id-must-strip',
+      rateLimitUpsell: null,
+    });
     return;
   }
 
@@ -514,14 +561,6 @@ async function handleRequest(msg) {
     };
     activeTurns.set(turnId, turnState);
 
-    if (directive.mode === 'ui_stream') {
-      sendNotification('item/reasoning/summaryTextDelta', {
-        threadId: meta.id, turnId, itemId: 'ui-reasoning', delta: 'SECRET_THOUGHT_DELTA tokens=80000/100000; ',
-      });
-      sendNotification('item/reasoning/textDelta', {
-        threadId: meta.id, turnId, itemId: 'ui-reasoning', delta: 'sk-',
-      });
-    }
     sendResult(id, { turn: { id: turnId, status: 'inProgress', items: [] } });
     sendNotification('turn/started', {
       threadId: meta.id,
@@ -538,42 +577,6 @@ async function handleRequest(msg) {
         setTimeout(resolve, directive.maxWaitMs ?? 8000);
       });
       if (directive.afterSteerDelayMs) await sleep(directive.afterSteerDelayMs);
-    } else if (directive.mode === 'ui_stream') {
-      const scope = { threadId: meta.id, turnId };
-      sendNotification('item/started', {
-        ...scope, item: { type: 'commandExecution', id: 'ui-command', command: ['echo', 'Bearer', 'abcdefgh12345678'], status: 'inProgress' },
-      });
-      for (const delta of ['😀'.repeat(3000), 'SECRET_CMD_DELTA_LINE Bearer abcdef', 'gh12345678 sk-', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ end']) {
-        sendNotification('item/commandExecution/outputDelta', { ...scope, itemId: 'ui-command', delta });
-      }
-      sendNotification('item/completed', {
-        ...scope, item: { type: 'commandExecution', id: 'ui-command', status: 'completed', exitCode: 0, aggregatedOutput: 'NOT_ACTIVITY_SUMMARY' },
-      });
-      sendNotification('item/commandExecution/outputDelta', { ...scope, itemId: 'ui-command', delta: 'LATE_COMMAND_DELTA' });
-      sendNotification('item/started', { ...scope, item: { id: 'ui-reasoning', type: 'reasoning' } });
-      sendNotification('item/agentMessage/delta', { ...scope, itemId: 'ui-message', delta: 'Monitor-only agent delta' });
-      sendNotification('item/agentMessage/delta', { ...scope, itemId: `msg-${turnId}`, delta: 'Monitor answer' });
-      sendNotification('turn/plan/updated', {
-        ...scope, explanation: 'Inspect tokens and credentials', plan: [{ step: 'Review file', status: 'inProgress' }],
-      });
-      const diff = 'diff --git a/inside.txt b/inside.txt\n+++ b/inside.txt\n+SECRET_DIFF_BODY\n'
-        + '+++ b/../outside.txt\n+++ b/escape/outside.txt\n+++ b/inside.txt:stream\n+++ //not-local/share.txt\n';
-      sendNotification('turn/diff/updated', { ...scope, diff });
-      const deadline = Date.now() + 10_000;
-      while (!existsSync(path.join(stateDir, 'continue-ui-stream')) && Date.now() < deadline) await sleep(25);
-      sendNotification('item/reasoning/textDelta', {
-        ...scope, itemId: 'ui-reasoning', delta: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ Bearer abcdefgh12345678 complete',
-      });
-      sendNotification('item/completed', { ...scope, item: { id: 'ui-reasoning', type: 'reasoning' } });
-      sendNotification('item/completed', {
-        ...scope, item: { id: 'ui-message', type: 'agentMessage', phase: 'commentary', text: 'Monitor-only agent delta' },
-      });
-      for (let index = 0; index < (directive.bulkDiffs ?? 0); index += 1) {
-        sendNotification('turn/diff/updated', { ...scope, diff: `${diff}${'多'.repeat(32000)}` });
-      }
-      sendNotification('item/completed', {
-        ...scope, item: { id: 'ui-file-change', type: 'fileChange', status: 'completed', changes: [{ path: 'activity.txt' }] },
-      });
     } else if (directive.mode === 'stream_plan_diff') {
       await sleep(300);
       sendNotification('item/reasoning/summaryTextDelta', {
@@ -739,7 +742,7 @@ async function handleRequest(msg) {
         id: `msg-${turnId}`,
         type: 'agentMessage',
         phase: 'final_answer',
-        text: directive.mode === 'ui_stream' ? directive.answer : JSON.stringify(answerPayload),
+        text: JSON.stringify(answerPayload),
       },
     });
     sendNotification('turn/completed', {

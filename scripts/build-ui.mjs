@@ -9,7 +9,7 @@ const UI_DIST_DIR = path.join(ROOT_DIR, 'ui', 'dist');
 const TEMPLATE_PATH = path.join(UI_SRC_DIR, 'template.html');
 const ENTRY_JS_PATH = path.join(UI_SRC_DIR, 'main.js');
 const ENTRY_CSS_PATH = path.join(UI_SRC_DIR, 'styles.css');
-const OUT_HTML_PATH = path.join(UI_DIST_DIR, 'monitor.html');
+const OUT_HTML_PATH = path.join(UI_DIST_DIR, 'settings.html');
 
 const [jsResult, cssResult] = await Promise.all([
   esbuild.build({

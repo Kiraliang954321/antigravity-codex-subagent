@@ -282,7 +282,6 @@ export function createDiskJobStore(jobsDir, {
       }
       out.push({
         jobId: parsed.jobId,
-        ...(typeof parsed.conversationId === 'string' ? { conversationId: parsed.conversationId } : {}),
         description: parsed.description ?? '',
         sessionKey: parsed.sessionKey ?? null,
         threadId: parsed.threadId ?? null,
@@ -300,15 +299,14 @@ export function createDiskJobStore(jobsDir, {
     return out;
   };
 
-  const listUnclaimed = (excludeJobIds = new Set(), { includeConversationId = false, bypassCache = false } = {}) => {
+  const listUnclaimed = (excludeJobIds = new Set(), { bypassCache = false } = {}) => {
     if (bypassCache || !summaryCache || Date.now() >= summaryCache.refreshAt) {
       summaryCache = { rows: scanUnclaimed(), refreshAt: Date.now() + JOB_SUMMARY_CACHE_TTL_MS };
     }
     const now = Date.now();
     return summaryCache.rows
       .filter((row) => !excludeJobIds.has(row.jobId) && now <= Date.parse(row.expiresAt))
-      .map(({ conversationId, ...row }) =>
-        includeConversationId && conversationId !== undefined ? { ...row, conversationId } : row);
+      .map((row) => ({ ...row }));
   };
 
   return {

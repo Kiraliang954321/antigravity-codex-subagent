@@ -6,9 +6,9 @@
 
 **English** | [简体中文](./README.zh-CN.md)
 
-Standalone Node.js stdio MCP server & **Antigravity MCP App** plugin for **Antigravity** that delegates tasks to an independent OpenAI Codex subagent over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol — complete with a built-in visual **Codex Monitor UI** (`Aux Pane` + `Global` sidebar view).
+Standalone Node.js stdio MCP server & **Antigravity MCP App** plugin for **Antigravity** that delegates tasks to an independent OpenAI Codex subagent over the official `@openai/codex` `app-server --stdio` JSON-RPC v2 protocol — complete with a built-in **Codex Default Settings** sidebar panel (`Global` view) synced bidirectionally with `~/.codex/config.toml`.
 
-Supports persistent multi-turn threads (`sessionKey` / `threadId`), live Gemini ↔ Codex conversation & telemetry timelines, interactive UI mid-turn steering (`steer`), clickable diff file navigation, protocol-level sandbox switching (`read-only` / `workspace-write` / `danger-full-access`), multimodal local image inputs, JSON Schema `outputSchema`, MCP `notifications/progress`, in-place context compaction (`compact`), thread branching (`fork`), crash/restart recovery, and an opt-in warm worker pool.
+Supports persistent multi-turn threads (`sessionKey` / `threadId`), live telemetry & progress reporting, mid-turn steering (`steer`), protocol-level sandbox switching (`read-only` / `workspace-write` / `danger-full-access`), multimodal local image inputs, JSON Schema `outputSchema`, MCP `notifications/progress`, in-place context compaction (`compact`), thread branching (`fork`), crash/restart recovery, and an opt-in warm worker pool.
 
 ## Prerequisites
 
@@ -44,27 +44,27 @@ Supports persistent multi-turn threads (`sessionKey` / `threadId`), live Gemini 
   - **Thread lifecycle operations**: in-place compaction (`action: "compact"`), thread branching (`action: "fork"` with `targetSessionKey` and optional `lastTurnId`), and archiving (`action: "close"`).
 - `subagent_codex_wait`: Continue waiting for, steer (`steer` + optional `images`), or cancel a background Codex job when `subagent_codex` returns `status: "running"` with a `jobId` and live `telemetry` (`turnId`, `phase`, `lastActivityAt`, monotonic `idleMs`, `currentActivity`, `activeCount`, 5-item `recentActivities` ring buffer, `plan`, `diffSummary`, `tokenUsage`). Unclaimed settled job receipts are atomically persisted to an isolated per-store directory (`data/jobs/<store>-<hash>/<jobId>.json`, 30-minute TTL) so results survive MCP server restarts. Also emits throttled MCP `notifications/progress` when `_meta.progressToken` is supplied.
 - `subagent_codex_list_sessions`: Inspect persistent Codex threads (`sessions`, including `used` and `contextWindow`) and active or unclaimed background jobs (`activeJobs`, including live telemetry and disk-persisted unclaimed receipts).
-- `subagent_codex_monitor`: Open the built-in Antigravity **MCP App** Monitor UI (`ui://codex-subagent/monitor.html`), also launchable directly from Antigravity's **Aux Pane `+` menu** (`Codex Monitor`) or **Left Sidebar** (`Codex Subagent`). Powered by four app-only tools (`codex_ui_list_conversations`, `codex_ui_get_conversation`, `codex_ui_steer`, `codex_ui_action`) hidden from the model (`visibility: ["app"]`) so UI polling and streaming telemetry never pollute Gemini's context window.
+- `subagent_codex_settings`: Open the built-in Antigravity **MCP App** Codex Default Settings panel (`ui://codex-subagent/settings.html`), also launchable directly from Antigravity's **Left Sidebar** (`Codex Subagent`). Powered by two app-only tools (`codex_ui_get_settings`, `codex_ui_update_settings`) hidden from the model (`visibility: ["app"]`) so UI reads and writes never consume model context.
 
-## Codex Monitor UI (`v0.5.0`)
+## Codex Default Settings Panel
 
-Open **Codex Monitor** from the side-pane **`+`** menu (per-conversation auxiliary pane) or **Codex Subagent** from the left sidebar (full-page cross-session workspace view):
+Open **Codex Subagent** from Antigravity's left sidebar to configure global Codex defaults in one place:
 
-- **Gemini ↔ Codex Timeline**: View delegation prompts with sandbox/model/effort badges, execution plan checklists, collapsible reasoning & command output streams, unified diffs, inline `Steer` callouts, and Markdown-rendered Codex replies.
-- **Heartbeat & Context Meter**: Live phase indicator (`Thinking`, `Running command`, `Streaming`, etc.), elapsed & heartbeat idle timers, plus a Token Context bar with an automatic `>= 80%` warning and one-click `Compact` button.
-- **Direct Interactive Controls**: Send live mid-turn steering instructions (`Steer`) or `Cancel` active jobs from the UI without claiming Gemini's background job receipt; run `Compact`, `Fork`, `Close / Archive`, or `Clear History` cleanly.
-- **Native Antigravity Integration**: Click changed workspace files in diff cards to open them in Antigravity's side-pane file viewer (`com.google.antigravity/toggle-aux-pane`), and hand Codex replies back to Gemini (`Attach to Gemini` / `Send to Gemini`) when host capabilities permit; adapts automatically to Antigravity dark/light themes and English/Chinese locales.
+- **Bidirectional `~/.codex/config.toml` Sync**: Reads and updates `model` and `model_reasoning_effort` directly via Codex's `config/read` and `config/batchWrite` RPCs so changes apply to both subsequent `codex-subagent` runs (and evict stale warm workers) and Codex CLI/Desktop itself.
+- **Synced Model & Effort Catalog**: Fetches available Codex models (`model/list`) and dynamically shows per-model `supportedReasoningEfforts` (clamping unsupported selections automatically when switching models), with a manual custom model ID toggle when needed.
+- **Live Account Quota Bars**: Fetches current account rate limits via `account/rateLimits/read`, displaying remaining-percentage progress bars with continuous usage-driven color gradients and plan-aware windows (Plus shows 5-hour + weekly limits; Pro tiers omit the 5-hour limit and show weekly only).
+- **Override Awareness**: Surfaces active environment overrides (`CODEX_MODEL`, `CODEX_REASONING_EFFORT`) or external Codex config layer overrides, adapts automatically to Antigravity dark/light themes and English/Chinese locales, and allows resetting back to Codex defaults.
 
 ## Configuration (`mcp_config.json` `env`)
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `CODEX_MODEL` | unset (inherits `~/.codex/config.toml`) | Optional default Codex model for new sessions (resumed turns preserve their prior session model unless overridden per call). |
-| `CODEX_REASONING_EFFORT` | unset (inherits `~/.codex/config.toml`) | Optional default reasoning effort (`low`, `medium`, `high`, `xhigh`). |
+| `CODEX_MODEL` | unset (inherits `~/.codex/config.toml`) | Optional default Codex model override (resumed turns preserve their prior session model unless overridden by live settings panel or per-call `model`). |
+| `CODEX_REASONING_EFFORT` | unset (inherits `~/.codex/config.toml`) | Optional default reasoning effort (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`). |
 | `CODEX_DEFAULT_WAIT_MS` | `120000` | Default synchronous wait window in ms before returning `status: "running"` (`1000..150000`). |
 | `CODEX_PERMISSION_MODE` | `never` | Default approval/sandbox preset (`never`, `read-only`, `approve-for-me`, `dangerously-bypass-approvals-and-sandbox`). |
 | `CODEX_SANDBOX` | unset | Optional default sandbox override (`read-only`, `workspace-write`, `danger-full-access`). |
-| `CODEX_WARM_IDLE_MS` | `0` in code (`180000` in default `mcp_config.json`) | Opt-in warm `app-server` worker idle TTL in ms. When `0`, each turn spawns a fresh process. When `> 0`, consecutive persistent turns with matching `(cwd, permissionMode, sandbox, model, config)` reuse the initialized worker and evict cleanly on config change, idle timeout, compact/fork, close, or shutdown. |
+| `CODEX_WARM_IDLE_MS` | `0` in code (`180000` in default `mcp_config.json`) | Opt-in warm `app-server` worker idle TTL in ms. When `0`, each turn spawns a fresh process. When `> 0`, consecutive persistent turns with matching `(cwd, permissionMode, sandbox, model, config)` and unchanged `config.toml` mtime reuse the initialized worker and evict cleanly on config change, idle timeout, compact/fork, close, or shutdown. |
 | `CODEX_EOF_GRACE_MS` | `6000` | Grace period waiting for clean child exit after closing stdin. |
 | `CODEX_DISPOSE_GRACE_MS` | `3000` | Bounded grace period waiting after subprocess termination. |
 | `CODEX_REQUEST_TIMEOUT_MS` | `30000` | Per-RPC request timeout in ms (inside `codex-wire.mjs`). |
@@ -75,20 +75,19 @@ Open **Codex Monitor** from the side-pane **`+`** menu (per-conversation auxilia
 | `CODEX_WRAPPER_PATH` | auto-resolved | Optional explicit path to `@openai/codex/bin/codex.js` (auto-resolves from local `node_modules`, standard global npm directories, or optional DSH profile). |
 | `CODEX_ANCHOR_PATH` | unset | Optional directory anchor searched when resolving `@openai/codex`. |
 | `CODEX_HOME` | unset | Optional Codex home directory override. |
-| `CODEX_MONITOR_HTML` | `<plugin>/ui/dist/monitor.html` | Optional file path override for the MCP App Monitor UI HTML (re-read live on `resources/read` for fast UI development). |
+| `CODEX_SETTINGS_HTML` | `<plugin>/ui/dist/settings.html` | Optional file path override for the MCP App Settings UI HTML (re-read live on `resources/read` when mtime/size changes). |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | unset (inherits environment) | Optional proxy settings forwarded to the spawned `codex app-server` child. |
 
 ## Architecture
 
-- `mcp/server.mjs`: MCP stdio JSON-RPC server, MCP App resource/entrypoint handlers (`ui://`), tool schemas, job lifecycle, telemetry aggregation, and warm worker coordination.
-- `mcp/codex-wire.mjs`: `@openai/codex app-server --stdio` JSON-RPC v2 framing, activity/delta heartbeats, UI-only stream/diff/activity diagnostics, plan/diff coalescing, and turn/thread RPC methods.
-- `mcp/codex-client.mjs`: Subprocess lifecycle, `@openai/codex` binary resolution, thread config assertions, rollout JSONL validation, warm worker pool, `compact`, and `fork`.
+- `mcp/server.mjs`: MCP stdio JSON-RPC server, MCP App settings resource/entrypoint handlers (`ui://`), tool schemas, job lifecycle, telemetry aggregation, and warm worker coordination.
+- `mcp/codex-wire.mjs`: `@openai/codex app-server --stdio` JSON-RPC v2 framing, activity/delta heartbeats, plan/diff coalescing, config/model RPCs, and turn/thread RPC methods.
+- `mcp/codex-client.mjs`: Subprocess lifecycle, `@openai/codex` binary resolution, bidirectional Codex config/model catalog sync, thread config assertions, rollout JSONL validation, warm worker pool, `compact`, and `fork`.
 - `mcp/session-store.mjs`: Persistent session registry with exclusive `.lock` fencing, uncertain reconciliation coordination, and atomic fork/lease transactions.
 - `mcp/disk-job-store.mjs`: Per-store isolated disk job receipts and atomic single-claim recovery across MCP restarts.
-- `mcp/transcript-store.mjs`: Per-store isolated UI transcript store (`data/transcripts/`), stream delta coalescing with monotonic sequence polling (`afterSeq`), and secret pattern redaction (`redactSecrets`).
 - `mcp/local-path-guard.mjs`: Path/reparse/UNC/device/network-drive guards and multimodal `localImage` validation.
 - `mcp/subprocess-adapter.mjs`: Cross-platform subprocess spawn/drain/tree-termination adapter (`taskkill /T /F` on Windows).
-- `ui/`: Frontend MCP App built with `@modelcontextprotocol/ext-apps` and bundled via `esbuild` into self-contained single-file `ui/dist/monitor.html` (zero runtime npm dependencies required).
+- `ui/`: Frontend MCP App built with `@modelcontextprotocol/ext-apps` and bundled via `esbuild` into self-contained single-file `ui/dist/settings.html` (zero runtime npm dependencies required).
 
 ## Testing
 
@@ -98,7 +97,7 @@ Run offline unit, protocol, concurrency, and mock-MCP tests (no network or Codex
 npm run test:unit
 ```
 
-Rebuild the single-file MCP App bundle (`ui/dist/monitor.html`) when developing under `ui/src/` (requires `devDependencies` via `npm install`):
+Rebuild the single-file MCP App bundle (`ui/dist/settings.html`) when developing under `ui/src/` (requires `devDependencies` via `npm install`):
 
 ```bash
 npm run build:ui

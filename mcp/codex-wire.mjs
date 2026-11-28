@@ -1201,6 +1201,11 @@ export function createCodexWire({
       return requireObject(await request('model/list', cleanParams, options), 'model/list response');
     },
 
+    async readAccountRateLimits(params = {}, options = {}) {
+      const cleanParams = requireObject(params, 'account/rateLimits/read params');
+      return requireObject(await request('account/rateLimits/read', cleanParams, options), 'account/rateLimits/read response');
+    },
+
     async batchWriteConfig(params, options = {}) {
       const cleanParams = requireObject(params, 'config/batchWrite params');
       return requireObject(await request('config/batchWrite', cleanParams, options), 'config/batchWrite response');

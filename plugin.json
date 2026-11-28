@@ -2,11 +2,11 @@
   "name": "codex-subagent",
   "displayName": "Codex Subagent",
   "version": "0.5.0",
-  "description": "Persistent Codex subagent MCP server and Antigravity MCP App monitor UI over the official Codex app-server protocol with live Gemini <-> Codex timeline, aux pane & global views, live mid-turn steering, clickable workspace diffs, sessionKey/threadId persistence, streaming/plan/diff telemetry, MCP progress notifications, protocol-level sandbox switching, multimodal local images, JSON Schema outputSchema, in-place context compaction, thread forking, restart-resilient background jobs, and opt-in warm workers.",
+  "description": "Persistent Codex subagent MCP server and Antigravity MCP App settings panel over the official Codex app-server protocol with sessionKey/threadId persistence, streaming/plan/diff telemetry, MCP progress notifications, protocol-level sandbox switching, multimodal local images, JSON Schema outputSchema, in-place context compaction, thread forking, restart-resilient background jobs, opt-in warm workers, and bidirectional ~/.codex/config.toml default model/reasoning effort configuration.",
   "logo": "assets/logo.png",
   "suggestedPrompts": [
     "Use subagent_codex in read-only sandbox mode to inspect this repository and summarize its architecture",
     "Continue our previous Codex analysis using the same sessionKey (or compact/fork it when needed)",
-    "Open Codex Monitor to inspect live progress, or list and close finished persistent sessions"
+    "Open Codex Subagent Settings to configure the default Codex model and reasoning effort synced with ~/.codex/config.toml"
   ]
 }

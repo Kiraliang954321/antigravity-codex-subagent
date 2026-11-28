@@ -2183,7 +2183,10 @@ async function withCodexConfigWire({
     return await run(wire);
   } finally {
     try {
-      await disposeCodexChild(wire, child, { eofGraceMs, disposeGraceMs });
+      await disposeCodexChild(wire, child, {
+        eofGraceMs: Math.min(eofGraceMs, 250),
+        disposeGraceMs: Math.min(disposeGraceMs, 2000),
+      });
     } finally {
       child.stderr?.off('error', onStderrError);
     }
@@ -2218,36 +2221,142 @@ function normalizeCatalogModel(entry) {
   };
 }
 
+function isRateLimitObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isProPlanWithoutFiveHourLimit(planType) {
+  return ['pro', 'prolite', 'promax', 'edu_pro'].includes(planType?.trim().toLowerCase());
+}
+
+function roundPercent(num) {
+  const clamped = Math.max(0, Math.min(100, num));
+  return Math.round(clamped * 10) / 10;
+}
+
+function normalizeRateLimitWindow(win) {
+  if (!isRateLimitObject(win) || !Number.isFinite(win.usedPercent)) return null;
+
+  const usedPercent = roundPercent(win.usedPercent);
+  const remainingPercent = roundPercent(100 - usedPercent);
+  const windowDurationMins = Number.isInteger(win.windowDurationMins) && win.windowDurationMins > 0
+    ? win.windowDurationMins : null;
+  const resetsAt = Number.isFinite(win.resetsAt) && win.resetsAt > 0 ? Math.floor(win.resetsAt) : null;
+  let kind = 'window';
+  if (windowDurationMins === 300) kind = 'five_hour';
+  else if (windowDurationMins === 10080) kind = 'weekly';
+  else if (windowDurationMins === 1440) kind = 'daily';
+  return { kind, usedPercent, remainingPercent, windowDurationMins, resetsAt };
+}
+
+function normalizeCreditsSnapshot(credits) {
+  if (!isRateLimitObject(credits)) return null;
+
+  const { balance } = credits;
+  const balanceText = typeof balance === 'string' ? balance.trim() : Number.isFinite(balance) ? String(balance) : '';
+  return {
+    hasCredits: Boolean(credits.hasCredits),
+    unlimited: Boolean(credits.unlimited),
+    balance: balanceText.slice(0, 64) || null,
+  };
+}
+
+function emptyRateLimitsSnapshot(error = null) {
+  return {
+    available: false,
+    planType: null,
+    ordinaryUsageAllowed: null,
+    windows: [],
+    credits: null,
+    spendControlReached: null,
+    rateLimitReachedType: null,
+    updatedAt: null,
+    error,
+  };
+}
+
+function normalizeRateLimitsResponse(response) {
+  const byLimitId = response?.rateLimitsByLimitId;
+  const bucket = isRateLimitObject(byLimitId?.codex) ? byLimitId.codex
+    : isRateLimitObject(response?.rateLimits) ? response.rateLimits
+    : Object.values(byLimitId ?? {}).find(isRateLimitObject);
+  if (!bucket) return emptyRateLimitsSnapshot('Invalid rate limits response');
+
+  const planType = typeof bucket.planType === 'string' ? bucket.planType.trim().toLowerCase() || null : null;
+  let windows = [bucket.primary, bucket.secondary].map(normalizeRateLimitWindow).filter(Boolean);
+  if (isProPlanWithoutFiveHourLimit(planType)) {
+    if (windows.length > 1 && windows.some((window) => window.kind !== 'five_hour')) {
+      windows = windows.filter((window) => window.kind !== 'five_hour');
+    }
+    if (windows.length === 1 && windows[0].windowDurationMins === null) windows[0].kind = 'weekly';
+  }
+  windows.sort((a, b) => (a.windowDurationMins ?? Number.POSITIVE_INFINITY) - (b.windowDurationMins ?? Number.POSITIVE_INFINITY));
+
+  return {
+    available: true,
+    planType,
+    ordinaryUsageAllowed: typeof response?.ordinaryUsageAllowed === 'boolean' ? response.ordinaryUsageAllowed : null,
+    windows,
+    credits: normalizeCreditsSnapshot(bucket.credits),
+    spendControlReached: typeof bucket.spendControlReached === 'boolean' ? bucket.spendControlReached : null,
+    rateLimitReachedType: typeof bucket.rateLimitReachedType === 'string' ? bucket.rateLimitReachedType.trim() || null : null,
+    updatedAt: new Date().toISOString(),
+    error: null,
+  };
+}
+
+async function readCodexRateLimits(wire, options) {
+  try {
+    const rlTimeoutMs = Math.min(options.requestTimeoutMs ?? 30_000, 10_000);
+    const requestOptions = { signal: options.signal, timeoutMs: rlTimeoutMs };
+    let response;
+    try {
+      response = await wire.readAccountRateLimits({ excludeResetCreditDetails: true }, requestOptions);
+    } catch (error) {
+      if (!(error instanceof CodexRpcError) || (error.code !== -32602 && error.code !== -32600)) throw error;
+      response = await wire.readAccountRateLimits({}, requestOptions);
+    }
+    return normalizeRateLimitsResponse(response);
+  } catch (error) {
+    return emptyRateLimitsSnapshot(sanitizeRpcErrorMessage(error));
+  }
+}
+
 export async function readCodexConfigAndModels(options = {}) {
   const { signal } = options;
   try {
     return await withCodexConfigWire(options, async (wire) => {
-      let cfg;
-      let configError = null;
-      try {
-        cfg = await wire.readConfig({ includeLayers: false }, { signal });
-      } catch (error) {
-        configError = sanitizeRpcErrorMessage(error);
-      }
-      let models = [];
-      let catalogError = null;
-      try {
-        let cursor;
-        for (let page = 0; page < 10 && models.length < 200; page += 1) {
-          const result = await wire.listModels({ includeHidden: false, ...(cursor ? { cursor } : {}) }, { signal });
-          if (!Array.isArray(result.data)) throw new Error('model/list response must contain a data array');
-          for (const entry of result.data) {
-            if (!entry || entry.hidden === true || (entry.id == null && entry.model == null)) continue;
-            models.push(normalizeCatalogModel(entry));
-            if (models.length === 200) break;
+      const [{ cfg, configError }, { models, catalogError }, rateLimits] = await Promise.all([
+        (async () => {
+          try {
+            const cfg = await wire.readConfig({ includeLayers: false }, { signal });
+            return { cfg, configError: null };
+          } catch (error) {
+            return { cfg: undefined, configError: sanitizeRpcErrorMessage(error) };
           }
-          cursor = result.nextCursor;
-          if (!cursor) break;
-        }
-      } catch (error) {
-        models = [];
-        catalogError = sanitizeRpcErrorMessage(error);
-      }
+        })(),
+        (async () => {
+          try {
+            const models = [];
+            let cursor;
+            for (let page = 0; page < 10 && models.length < 200; page += 1) {
+              const result = await wire.listModels({ includeHidden: false, ...(cursor ? { cursor } : {}) }, { signal });
+              if (!Array.isArray(result.data)) throw new Error('model/list response must contain a data array');
+              for (const entry of result.data) {
+                if (!entry || entry.hidden === true || (entry.id == null && entry.model == null)) continue;
+                models.push(normalizeCatalogModel(entry));
+                if (models.length === 200) break;
+              }
+              cursor = result.nextCursor;
+              if (!cursor) break;
+            }
+            return { models, catalogError: null };
+          } catch (error) {
+            return { models: [], catalogError: sanitizeRpcErrorMessage(error) };
+          }
+        })(),
+        readCodexRateLimits(wire, options),
+      ]);
       const { model, reasoningEffort } = configModelSettings(cfg);
       const catalogDefaultModel = models.find((entry) => entry.isDefault)?.model ?? models[0]?.model ?? null;
       const matchedModel = models.find((entry) => entry.model.toLowerCase() === (model ?? catalogDefaultModel ?? '').toLowerCase());
@@ -2261,9 +2370,11 @@ export async function readCodexConfigAndModels(options = {}) {
         catalogAvailable: catalogError === null,
         ...(catalogError === null ? {} : { catalogError }),
         error: configError ?? catalogError,
+        rateLimits,
       };
     });
   } catch (error) {
+    const message = cleanDiagnosticText(toError(error).message);
     return {
       synced: false,
       model: null,
@@ -2272,7 +2383,8 @@ export async function readCodexConfigAndModels(options = {}) {
       catalogDefaultReasoningEffort: null,
       models: [],
       catalogAvailable: false,
-      error: cleanDiagnosticText(toError(error).message),
+      error: message,
+      rateLimits: emptyRateLimitsSnapshot(message),
     };
   }
 }

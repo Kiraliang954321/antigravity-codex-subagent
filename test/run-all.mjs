@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -20,7 +20,6 @@ const wireMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'codex-
 const clientMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'codex-client.mjs')).href);
 const storeMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'session-store.mjs')).href);
 const pathGuardMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'local-path-guard.mjs')).href);
-const transcriptMod = await import(pathToFileURL(path.join(PLUGIN_ROOT, 'mcp', 'transcript-store.mjs')).href);
 
 // Minimal valid 1x1 red PNG
 const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
@@ -1468,418 +1467,209 @@ await test('16. action: "fork" branching with lastTurnId, source protection unde
   }
 });
 
-async function pollMonitor(check, timeoutMs = 6000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = await check();
-    if (value) return value;
-    assert.ok(Date.now() < deadline, 'monitor polling timed out');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-function monitorEnv(dir, extra = {}) {
+function settingsEnv(dir, extra = {}) {
   return {
     CODEX_WRAPPER_PATH: MOCK_WRAPPER,
     CODEX_SESSION_STORE_PATH: path.join(dir, 'sessions.json'),
+    CODEX_HOME: path.join(dir, 'mock'),
+    CODEX_MODEL: '',
+    CODEX_REASONING_EFFORT: '',
+    CODEX_SETTINGS_HTML: '',
     MOCK_CODEX_STATE_DIR: path.join(dir, 'mock'),
-    CODEX_MONITOR_HTML: '',
     ...extra,
   };
 }
 
-function monitorPayload(result) {
+function settingsPayload(result) {
   assert.ok(!result.isError, toolText(result));
-  const text = toolText(result);
-  assert.ok(text.length > 0 && text.length <= 128);
-  assert.doesNotMatch(text, /^\s*[\[{]/);
   assert.ok(result.structuredContent && typeof result.structuredContent === 'object');
   return result.structuredContent;
 }
 
-await test('18. MCP Apps resource discovery, fresh override, and app-only tool metadata', async () => {
-  const dir = path.join(TEST_WORK_DIR, 'monitor-resource');
-  mkdirSync(dir);
+await test('18. Settings resource discovery, HTML cache and size limits, and exact MCP tool metadata', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'settings-resource');
+  const serverPath = path.join(dir, 'mcp', 'server.mjs');
+  const defaultHtml = path.join(dir, 'ui', 'dist', 'settings.html');
   const override = path.join(dir, 'override.html');
-  const uri = 'ui://codex-subagent/monitor.html';
+  const uri = 'ui://codex-subagent/settings.html';
   const mimeType = 'text/html;profile=mcp-app';
-  const srv = startMcpServer(monitorEnv(dir));
+  const maxBytes = 10 * 1024 * 1024;
+  const first = '<!doctype html><title>Codex Settings</title><p>first</p>';
+  const second = '<!doctype html><title>Codex Settings</title><p>other</p>';
+  const timestamp = new Date('2025-01-01T00:00:00Z');
+  const changed = new Date('2025-01-01T00:00:01Z');
+  mkdirSync(path.dirname(defaultHtml), { recursive: true });
+  cpSync(path.join(PLUGIN_ROOT, 'mcp'), path.dirname(serverPath), { recursive: true });
+  writeFileSync(defaultHtml, first);
+  utimesSync(defaultHtml, timestamp, timestamp);
+  const checkLimit = async (srv, filename) => {
+    writeFileSync(filename, first.padEnd(maxBytes - 1, ' ') + '!');
+    const { contents } = await srv.request('resources/read', { uri });
+    assert.equal(Buffer.byteLength(contents[0].text, 'utf8'), maxBytes);
+    assert.ok(contents[0].text.endsWith('!'));
+    const fd = openSync(filename, 'r+');
+    try { ftruncateSync(fd, maxBytes + 1); } finally { closeSync(fd); }
+    await assert.rejects(srv.request('resources/read', { uri }), /RPC error -32603/);
+  };
+  const srv = startMcpServer(settingsEnv(dir), serverPath);
   try {
     assert.deepEqual((await srv.request('initialize')).capabilities, { tools: {}, resources: {} });
     const { resources } = await srv.request('resources/list');
     assert.deepEqual(resources, [{
-      uri, mimeType, name: 'Codex Subagent Monitor', description: 'Live Gemini <-> Codex monitor and interactive control panel.',
+      uri, mimeType, name: 'Codex Subagent Settings',
+      description: 'Configure default Codex model and reasoning effort synced with ~/.codex/config.toml.',
       _meta: { ui: { prefersBorder: false } },
     }]);
-    const { contents } = await srv.request('resources/read', { uri });
-    assert.equal(contents[0].mimeType, mimeType);
-    assert.deepEqual(contents[0]._meta, resources[0]._meta);
+    const read = () => srv.request('resources/read', { uri });
+    const { contents } = await read();
+    assert.deepEqual(contents, [{ uri, mimeType, text: first, _meta: resources[0]._meta }]);
     assert.match(contents[0].text, /<!doctype html>/i);
-    assert.match(contents[0].text, /Codex Monitor/);
-    assert.deepEqual((await srv.request('resources/read', { uri })).contents, contents);
-    await assert.rejects(srv.request('resources/read', { uri: `${uri}/unknown` }), /RPC error -32602/);
+    assert.match(contents[0].text, /Codex Settings/i);
+    writeFileSync(defaultHtml, second);
+    utimesSync(defaultHtml, timestamp, timestamp);
+    assert.deepEqual((await read()).contents, contents, 'same path, mtime and size use cached HTML');
+    utimesSync(defaultHtml, changed, changed);
+    assert.equal((await read()).contents[0].text, second, 'a changed mtime invalidates the cache');
+    writeFileSync(defaultHtml, second + '!');
+    utimesSync(defaultHtml, changed, changed);
+    assert.equal((await read()).contents[0].text, second + '!', 'a changed size invalidates the cache');
+    await checkLimit(srv, defaultHtml);
+    await assert.rejects(srv.request('resources/read', { uri: 'ui://codex-subagent/monitor.html' }), /RPC error -32602/);
+
     const { tools } = await srv.request('tools/list');
-    const open = tools.find((tool) => tool.name === 'subagent_codex_monitor');
-    assert.equal(open._meta.ui.resourceUri, uri);
-    assert.deepEqual(open._meta['com.google.antigravity/ui'].entrypoints, [
-      { type: 'aux_pane', title: 'Codex Monitor' }, { type: 'global', title: 'Codex Subagent' },
+    assert.deepEqual(tools.map((tool) => tool.name), [
+      'subagent_codex', 'subagent_codex_wait', 'subagent_codex_list_sessions', 'subagent_codex_settings',
+      'codex_ui_get_settings', 'codex_ui_update_settings',
     ]);
-    const appTools = tools.filter((tool) => tool.name.startsWith('codex_ui_'));
-    assert.deepEqual(appTools.map((tool) => tool.name).sort(), [
-      'codex_ui_action', 'codex_ui_get_conversation', 'codex_ui_get_settings', 'codex_ui_list_conversations', 'codex_ui_steer', 'codex_ui_update_settings',
-    ]);
-    for (const tool of appTools) assert.deepEqual(tool._meta.ui.visibility, ['app']);
-    const opened = await srv.callTool(open.name, {});
-    assert.equal(toolText(opened), 'Codex Subagent Monitor');
-    const { cursorEpoch, ...payload } = monitorPayload(opened);
-    assert.match(cursorEpoch, /^[a-f0-9-]{36}$/);
-    assert.deepEqual(payload, {
-      serverVersion: '0.5.0', initialConversationId: null, counts: { running: 0, sessions: 0, total: 0 },
-      initialSnapshot: { conversations: [], hasMoreConversations: false, initialConversation: null },
+    const open = tools.find((tool) => tool.name === 'subagent_codex_settings');
+    assert.deepEqual(open.inputSchema, { type: 'object', additionalProperties: false, properties: {} });
+    assert.deepEqual(open._meta, {
+      ui: { resourceUri: uri }, 'com.google.antigravity/ui': { entrypoints: [{ type: 'global', title: 'Codex Subagent' }] },
     });
-    const listed = monitorPayload(await srv.callTool('codex_ui_list_conversations', { include: 'initialConversation' }));
-    assert.equal(listed.cursorEpoch, cursorEpoch);
-    assert.deepEqual(listed.conversations, []);
-    assert.equal(listed.hasMoreConversations, false);
-    assert.equal(listed.initialConversation, null);
+    const appTools = tools.filter((tool) => tool._meta?.ui?.visibility?.includes('app'));
+    assert.deepEqual(appTools.map((tool) => tool.name), ['codex_ui_get_settings', 'codex_ui_update_settings']);
+    for (const tool of appTools) assert.deepEqual(tool._meta.ui.visibility, ['app']);
+    assert.deepEqual(Object.keys(appTools[1].inputSchema.properties), ['reset', 'codex']);
+    for (const removed of [
+      'subagent_codex_monitor', 'codex_ui_list_conversations', 'codex_ui_get_conversation', 'codex_ui_steer', 'codex_ui_action',
+    ]) {
+      await assert.rejects(srv.callTool(removed), /RPC error -32602/);
+    }
+    const opened = await srv.callTool(open.name);
+    assert.equal(toolText(opened), 'Codex Subagent Settings');
+    const { serverVersion, ...payload } = settingsPayload(opened);
+    assert.match(serverVersion, /^\d+\.\d+\.\d+$/);
+    assert.deepEqual(payload, settingsPayload(await srv.callTool('codex_ui_get_settings', { syncCodex: false })));
+    assert.equal(payload.codexConfig.synced, false);
+    for (const invalid of [{ unknown: true }, [], null]) assert.equal((await srv.callTool(open.name, invalid)).isError, true);
+    assert.equal(existsSync(path.join(dir, 'mock')), false, 'opening settings must not spawn Codex');
   } finally {
     await srv.stop();
   }
-  const cacheDir = path.join(dir, 'cache');
-  const defaultHtml = path.join(cacheDir, 'ui', 'dist', 'monitor.html');
-  mkdirSync(path.dirname(defaultHtml), { recursive: true });
-  cpSync(path.join(PLUGIN_ROOT, 'mcp'), path.join(cacheDir, 'mcp'), { recursive: true });
-  const first = '<!doctype html><p>first</p>';
-  const second = '<!doctype html><p>other</p>';
-  const timestamp = new Date('2025-01-01T00:00:00Z');
-  writeFileSync(defaultHtml, first);
-  utimesSync(defaultHtml, timestamp, timestamp);
-  const cached = startMcpServer(monitorEnv(cacheDir), path.join(cacheDir, 'mcp', 'server.mjs'));
-  try {
-    const read = async () => (await cached.request('resources/read', { uri })).contents[0].text;
-    assert.equal(await read(), first);
-    writeFileSync(defaultHtml, second);
-    utimesSync(defaultHtml, timestamp, timestamp);
-    assert.equal(await read(), first, 'same path, mtime and size use the cached default HTML');
-    const changed = new Date('2025-01-01T00:00:01Z');
-    utimesSync(defaultHtml, changed, changed);
-    assert.equal(await read(), second);
-  } finally {
-    await cached.stop();
-  }
-  const custom = startMcpServer(monitorEnv(dir, { CODEX_MONITOR_HTML: override }));
+
+  const custom = startMcpServer(settingsEnv(dir, { CODEX_SETTINGS_HTML: ' ' + override + ' ' }));
   try {
     await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
-    for (const html of ['<!doctype html><p>first</p>', '<!doctype html><p>other</p>']) {
+    for (const html of [first, second]) {
       writeFileSync(override, html);
       utimesSync(override, timestamp, timestamp);
       assert.equal((await custom.request('resources/read', { uri })).contents[0].text, html);
     }
-    writeFileSync(override, '');
+    writeFileSync(override, ' \n');
     await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
-    rmSync(override);
-    await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
-    const fd = openSync(override, 'w');
-    try { ftruncateSync(fd, 10 * 1024 * 1024 + 1); } finally { closeSync(fd); }
-    await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
+    await checkLimit(custom, override);
   } finally {
     await custom.stop();
   }
-});
 
-await test('19. UI transcript coalescing, incremental polling, redaction, safe links, limits, and restart', async () => {
-  const dir = path.join(TEST_WORK_DIR, 'monitor-transcript');
-  const cwd = path.join(dir, 'work');
-  mkdirSync(cwd, { recursive: true });
-  const inside = path.join(cwd, 'inside.txt');
-  writeFileSync(inside, 'inside');
-  const absoluteInside = path.join(cwd, 'absolute.txt');
-  writeFileSync(absoluteInside, 'absolute');
-  const relativeAnswer = path.join(cwd, 'answer-relative.txt');
-  const activityFile = path.join(cwd, 'activity.txt');
-  writeFileSync(relativeAnswer, 'relative');
-  writeFileSync(activityFile, 'activity');
-  writeFileSync(path.join(dir, 'outside.txt'), 'outside');
-  symlinkSync(dir, path.join(cwd, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
-  const env = monitorEnv(dir);
-  const transcriptDir = transcriptMod.resolveIsolatedTranscriptsDir(env.CODEX_SESSION_STORE_PATH);
-  mkdirSync(transcriptDir, { recursive: true });
-  writeFileSync(path.join(transcriptDir, 'conv-00000000000000000000.json'), 'invalid JSON');
-  const sessionKey = 'monitor:session';
-  const conversationId = `session:${sessionKey}`;
-  const transcriptFile = path.join(transcriptDir, `conv-${createHash('sha256').update(conversationId).digest('hex').slice(0, 20)}.json`);
-  const absoluteTarget = (process.platform === 'win32' ? '/' : '') + absoluteInside.replaceAll('\\', '/');
-  const answer = `Monitor answer [inside](inside.txt:1) [relative](answer-relative.txt:1) [absolute](<${absoluteTarget}:2:3>) [outside](../outside.txt) [escape](escape/outside.txt)`;
-  const srv = startMcpServer(env);
-  let priorEpoch;
-  let jobId;
-  try {
-    const running = await srv.callTool('subagent_codex', {
-      cwd, sessionKey, description: 'Monitor stream', prompt: JSON.stringify({ mode: 'ui_stream', bulkDiffs: 8, answer }), waitMs: 1000,
-    }, { progressToken: 'monitor-private' });
-    const live = JSON.parse(toolText(running));
-    assert.equal(live.status, 'running');
-    jobId = live.jobId;
-    const opened = await srv.callTool('subagent_codex_monitor', { jobId });
-    assert.ok(Buffer.byteLength(JSON.stringify(opened)) <= 192 * 1024);
-    const openPayload = monitorPayload(opened);
-    assert.equal(openPayload.initialConversationId, conversationId);
-    assert.equal(openPayload.initialSnapshot.initialConversation.conversation.conversationId, conversationId);
-    assert.equal(openPayload.initialSnapshot.initialConversation.fileLinks, undefined);
-    const before = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
-    priorEpoch = before.cursorEpoch;
-    assert.equal(before.reset, false);
-    assert.equal(before.liveJob.jobId, jobId);
-    assert.equal(before.liveJob.steerable, true);
-    assert.equal(before.conversation.turnCount, 1);
-    assert.equal(before.conversation.latestPlan.explanation, 'Inspect tokens and credentials');
-    assert.deepEqual(before.fileLinks, [{ path: 'inside.txt', uri: pathToFileURL(inside).href }]);
-    assert.ok(before.events.some((event) => event.type === 'diff' && event.diff.includes('SECRET_DIFF_BODY')));
-    const command = before.events.find((event) => event.type === 'stream' && event.channel === 'commandOutput');
-    assert.equal(command.done, true);
-    assert.equal(command.truncated, true);
-    assert.ok(Buffer.byteLength(command.text) <= 8192 && Buffer.byteLength(command.text) > 8188);
-    assert.match(command.text, /^😀+SECRET_CMD_DELTA_LINE Bearer \[REDACTED\] sk-\[REDACTED\] end$/u);
-    const commentary = before.events.find((event) => event.itemId === 'ui-message');
-    const finalStream = before.events.find((event) => event.itemId === `msg-${before.liveJob.telemetry.turnId}`);
-    assert.equal(commentary.done, false);
-    assert.equal(finalStream.done, false);
-    assert.ok(before.events.some((event) => event.type === 'activity' && event.summary.command === 'echo Bearer [REDACTED]'));
-    assert.ok(before.events.some((event) => event.type === 'activity' && event.summary.exitCode === 0));
-    const streamEvent = before.events.find((event) => event.type === 'stream' && event.channel === 'reasoning');
-    assert.equal(streamEvent.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-');
-    assert.doesNotMatch(JSON.stringify([running, srv.getNotifications()]), /SECRET_THOUGHT_DELTA|SECRET_CMD_DELTA_LINE|SECRET_DIFF_BODY|abcdefgh12345678|itemCompleted|answerItemSelected/);
-
-    writeFileSync(path.join(env.MOCK_CODEX_STATE_DIR, 'continue-ui-stream'), 'go');
-    await pollMonitor(async () => {
-      const listed = monitorPayload(await srv.callTool('codex_ui_list_conversations'));
-      return listed.conversations[0]?.status === 'completed_unclaimed';
-    });
-    const bootResult = await srv.callTool('codex_ui_list_conversations', { include: 'initialConversation', conversationId });
-    assert.ok(Buffer.byteLength(JSON.stringify(bootResult)) <= 192 * 1024);
-    const boot = monitorPayload(bootResult);
-    assert.ok(Buffer.byteLength(JSON.stringify(boot.conversations)) <= 32 * 1024);
-    assert.equal(boot.initialConversation.hasMore, true);
-    assert.equal(boot.initialConversation.nextSeq, boot.initialConversation.events.at(-1).seq);
-    const bootNext = monitorPayload(await srv.callTool('codex_ui_get_conversation', {
-      conversationId, afterSeq: boot.initialConversation.nextSeq, cursorEpoch: boot.cursorEpoch, limit: 1,
-    }));
-    assert.ok(bootNext.events[0].seq > boot.initialConversation.nextSeq);
-    const incremental = await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: before.nextSeq, cursorEpoch: priorEpoch });
-    assert.ok(Buffer.byteLength(JSON.stringify(incremental), 'utf8') <= 512 * 1024);
-    const batch = monitorPayload(incremental);
-    assert.equal(batch.truncated, true);
-    assert.equal(batch.hasMore, true);
-    assert.equal(batch.nextSeq, batch.events.at(-1).seq);
-    const later = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: batch.nextSeq }));
-    assert.ok(later.events[0].seq > batch.nextSeq);
-    assert.equal(later.hasMore, false);
-    const events = [...batch.events, ...later.events];
-    assert.ok(![...before.events, ...events].some((event) => event.type === 'activity' && event.kind === 'reasoning'));
-    const updated = events.find((event) => event.eventId === streamEvent.eventId);
-    assert.ok(updated.seq > before.nextSeq);
-    assert.equal(updated.done, true);
-    assert.equal(updated.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-[REDACTED] Bearer [REDACTED] complete');
-    for (const [original, replacement] of [
-      [commentary, events.find((event) => event.type === 'activity' && event.kind === 'commentary')],
-      [finalStream, events.find((event) => event.type === 'answer')],
-    ]) {
-      const finished = events.find((event) => event.eventId === original.eventId);
-      assert.ok(finished.seq > before.nextSeq);
-      assert.equal(finished.startedAt, original.startedAt);
-      assert.equal(finished.done, true);
-      assert.equal(finished.superseded, true);
-      assert.equal(finished.supersededBy, replacement.eventId);
-      assert.equal(finished.text, '');
+  if (existsSync(path.join(PLUGIN_ROOT, 'ui', 'dist', 'settings.html'))) {
+    const packaged = startMcpServer(settingsEnv(dir));
+    try {
+      const { contents } = await packaged.request('resources/read', { uri });
+      assert.match(contents[0].text, /<!doctype html>/i);
+      assert.match(contents[0].text, /Codex Settings/i);
+    } finally {
+      await packaged.stop();
     }
-    assert.deepEqual(Object.fromEntries(later.fileLinks.map(({ path, uri }) => [path, uri])), {
-      'inside.txt': pathToFileURL(inside).href,
-      'activity.txt': pathToFileURL(activityFile).href,
-      'answer-relative.txt': pathToFileURL(relativeAnswer).href,
-      [absoluteInside.replaceAll('\\', '/')]: pathToFileURL(absoluteInside).href,
+  }
+});
+
+await test('19a. Account rate limits retry with legacy parameters', async () => {
+  for (const code of [-32602, -32600]) {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const exit = Promise.withResolvers();
+    const rateLimitParams = [];
+    stdin.once('finish', () => exit.resolve({ exitCode: 0 }));
+    stdin.on('data', (chunk) => {
+      const { id, method, params } = JSON.parse(chunk.toString());
+      if (id === undefined) return;
+      let result = {};
+      if (method === 'model/list') result = { data: [] };
+      if (method === 'account/rateLimits/read') {
+        rateLimitParams.push(params);
+        if (params.excludeResetCreditDetails === true) {
+          stdout.write(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message: 'mock legacy parameters required' } }) + '\n');
+          return;
+        }
+        result = {
+          rateLimitsByLimitId: {
+            other: { planType: ' PROLITE ', primary: { usedPercent: 12.34 } },
+          },
+        };
+      }
+      stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
     });
-    assert.doesNotMatch(readFileSync(transcriptFile, 'utf8'), /sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ|abcdefgh12345678|NOT_ACTIVITY_SUMMARY/);
-  } finally {
-    await srv.stop();
-  }
-  const legacy = JSON.parse(readFileSync(transcriptFile, 'utf8'));
-  assert.equal(legacy.version, 1);
-  const legacyAt = legacy.updatedAt;
-  for (const event of [
-    { eventId: 'legacy-progress', type: 'stream', channel: 'commandOutput', itemId: 'legacy-command', text: 'keep me' },
-    { eventId: 'legacy-commentary-stream', type: 'stream', channel: 'agentMessage', itemId: 'legacy-commentary', text: 'working' },
-    { eventId: 'legacy-commentary-activity', type: 'activity', kind: 'commentary', phase: 'completed', itemId: 'legacy-commentary', summary: { text: 'working' } },
-    { eventId: 'legacy-answer-stream', type: 'stream', channel: 'agentMessage', itemId: 'legacy-final', text: 'Finished.' },
-    { eventId: 'legacy-answer', type: 'answer', text: 'Finished.\n\n[codex-thread threadId=legacy resumed=true]\n[CONTEXT_WARNING] example' },
-  ]) legacy.events.push({ ...event, seq: ++legacy.nextSeq, at: legacyAt, jobId, turnId: 'legacy-turn' });
-  writeFileSync(transcriptFile, JSON.stringify(legacy));
-  const restarted = startMcpServer(env);
-  try {
-    const restored = monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, limit: 5 }));
-    assert.equal(restored.conversation.status, 'completed_unclaimed');
-    assert.equal(restored.liveJob, null);
-    assert.deepEqual(restored.fileLinks, [{ path: 'inside.txt', uri: pathToFileURL(inside).href }]);
-    const reset = monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, afterSeq: legacy.nextSeq, cursorEpoch: priorEpoch, limit: 1 }));
-    assert.notEqual(reset.cursorEpoch, priorEpoch);
-    assert.equal(reset.reset, true);
-    assert.equal(reset.events[0].eventId, restored.events[0].eventId);
-    const recoveredOnDisk = JSON.parse(readFileSync(transcriptFile, 'utf8'));
-    const patched = recoveredOnDisk.events.filter((event) => event.seq > legacy.nextSeq);
-    assert.equal(patched.length, 3);
-    assert.ok(patched.every((event) => event.done === true && event.startedAt === legacyAt));
-    assert.deepEqual(patched.map((event) => [event.eventId, event.text, event.supersededBy]), [
-      ['legacy-progress', 'keep me', undefined],
-      ['legacy-commentary-stream', '', 'legacy-commentary-activity'],
-      ['legacy-answer-stream', '', 'legacy-answer'],
-    ]);
-    assert.equal((await restarted.callTool('codex_ui_action', { action: 'clear_history', conversationId })).isError, true);
-    assert.ok(!(await restarted.callTool('subagent_codex_wait', { jobId })).isError);
-    assert.equal(monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, afterSeq: restored.nextSeq, limit: 1 })).events.length, 1);
-  } finally {
-    await restarted.stop();
+
+    const snapshot = await clientMod.readCodexConfigAndModels({
+      spawn: () => ({ stdin, stdout, pid: 1, done: exit.promise, waitForExit: async () => Boolean(await exit.promise) }),
+      argv: ['mock'], cwd: TEST_WORK_DIR,
+    });
+    assert.deepEqual(rateLimitParams, [{ excludeResetCreditDetails: true }, {}]);
+    assert.equal(snapshot.error, null);
+    assert.equal(snapshot.rateLimits.available, true);
+    assert.equal(snapshot.rateLimits.planType, 'prolite');
+    assert.deepEqual(snapshot.rateLimits.windows, [{
+      kind: 'weekly', usedPercent: 12.3, remainingPercent: 87.7, windowDurationMins: null, resetsAt: null,
+    }]);
   }
 });
 
-await test('20. UI mid-turn steer and cancel preserve Gemini job claims', async () => {
-  const dir = path.join(TEST_WORK_DIR, 'monitor-steer');
+await test('19. Settings sync and teardown, validated native writes, runtime defaults, and warm pool eviction', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'settings-config');
   mkdirSync(dir);
-  const srv = startMcpServer(monitorEnv(dir));
-  try {
-    const run = async (mode, options = {}) => JSON.parse(toolText(await srv.callTool('subagent_codex', {
-      cwd: dir, description: 'Monitor action', prompt: JSON.stringify({ mode, ...options }), waitMs: 1000,
-    })));
-    const first = await run('wait_for_steer', { maxWaitMs: 8000, afterSteerDelayMs: 1500 });
-    assert.equal(first.status, 'running');
-    const steerText = 'Continue with the UI instruction';
-    const steered = monitorPayload(await srv.callTool('codex_ui_steer', { jobId: first.jobId, steer: steerText }));
-    assert.deepEqual(steered, { ok: true, jobId: first.jobId, turnId: first.telemetry.turnId });
-    const conversationId = `ephemeral:${first.jobId}`;
-    const current = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
-    assert.equal(current.liveJob.status, 'running');
-    const steerEvents = current.events.filter((event) => event.type === 'steer');
-    assert.equal(steerEvents.length, 1);
-    assert.equal(steerEvents[0].source, 'user_ui');
-    assert.equal(steerEvents[0].text, steerText);
-    const reply = await srv.callTool('subagent_codex_wait', { jobId: first.jobId, waitMs: 5000 });
-    assert.deepEqual(JSON.parse(toolText(reply).split('\n\n[codex-thread')[0]).steeredInputs, [{ text: steerText, images: [] }]);
-    assert.equal((await srv.callTool('codex_ui_steer', { jobId: first.jobId, steer: 'too late' })).isError, true);
-
-    const second = await run('hang_turn');
-    const cancelled = monitorPayload(await srv.callTool('codex_ui_action', { action: 'cancel', jobId: second.jobId }));
-    assert.deepEqual(cancelled, { ok: true, action: 'cancel', jobId: second.jobId, settled: true });
-    const cancelledId = `ephemeral:${second.jobId}`;
-    const settled = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId: cancelledId }));
-    assert.equal(settled.liveJob.status, 'completed_unclaimed');
-    assert.ok(settled.events.some((event) => event.type === 'cancel' && event.source === 'user_ui'));
-    assert.equal((await srv.callTool('codex_ui_action', { action: 'clear_history', conversationId: cancelledId })).isError, true);
-    const claim = await srv.callTool('subagent_codex_wait', { jobId: second.jobId });
-    assert.equal(claim.isError, true);
-    assert.match(toolText(claim), /cancel|abort/i);
-    assert.doesNotMatch(toolText(claim), /unknown or already claimed/i);
-    assert.match(toolText(await srv.callTool('subagent_codex_wait', { jobId: second.jobId })), /unknown or already claimed/i);
-  } finally {
-    await srv.stop();
-  }
-});
-
-await test('21. UI compact, fork, close, and guarded history deletion', async () => {
-  const dir = path.join(TEST_WORK_DIR, 'monitor-lifecycle');
-  mkdirSync(dir);
-  const env = monitorEnv(dir, { MOCK_CODEX_COMPACT_DELAY_MS: '3400' });
-  const legacyThreadId = randomUUID();
-  const legacyStore = await storeMod.openCodexSessionStore({ file: env.CODEX_SESSION_STORE_PATH });
-  try {
-    const lease = await legacyStore.acquire({ sessionKey: 'legacy', cwd: dir });
-    try { await lease.commit({ threadId: legacyThreadId }); } finally { lease.release(); }
-  } finally {
-    await legacyStore.dispose();
-  }
-  const srv = startMcpServer(env);
-  try {
-    const action = (args) => srv.callTool('codex_ui_action', args);
-    const get = async (conversationId) => monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
-    const legacy = await get('session:legacy');
-    assert.equal(legacy.conversation.threadId, legacyThreadId);
-    assert.equal(legacy.conversation.status, 'ready');
-    assert.deepEqual(legacy.events, []);
-    assert.equal((await action({ action: 'clear_history', conversationId: 'session:legacy' })).isError, true);
-    const run = (more) => srv.callTool('subagent_codex', { cwd: dir, description: 'Lifecycle source', prompt: '{}', waitMs: 5000, ...more });
-    const source = await run({ sessionKey: 'source' });
-    assert.ok(!source.isError, toolText(source));
-    const { conversation: sourceMeta } = await get('session:source');
-    assert.equal((await action({ action: 'clear_history', conversationId: 'session:source' })).isError, true);
-    assert.equal((await action({ action: 'compact', sessionKey: 'source', cwd: dir })).isError, true);
-    assert.equal((await action({ action: 'fork', sessionKey: 'source', targetSessionKey: 'invalid key' })).isError, true);
-
-    const compact = monitorPayload(await action({ action: 'compact', threadId: sourceMeta.threadId }));
-    assert.equal(compact.status, 'running');
-    assert.equal((await get('session:source')).liveJob.jobId, compact.jobId);
-    assert.equal((await action({ action: 'close', sessionKey: 'source' })).isError, true);
-    assert.equal((await action({ action: 'fork', sessionKey: 'source', targetSessionKey: 'busy-target' })).isError, true);
-    await pollMonitor(async () => !(await get('session:source')).liveJob);
-    assert.ok((await get('session:source')).events.some((event) => event.type === 'compact' && !event.isError));
-    const jobsDir = isolatedJobsDirFor(env.CODEX_SESSION_STORE_PATH);
-    assert.ok(!existsSync(path.join(jobsDir, `${compact.jobId}.json`)));
-    assert.deepEqual(JSON.parse(toolText(await srv.callTool('subagent_codex_list_sessions'))).activeJobs, []);
-
-    const fork = monitorPayload(await action({ action: 'fork', sessionKey: 'source', targetSessionKey: 'target:fork' }));
-    assert.equal(fork.sourceThreadId, sourceMeta.threadId);
-    assert.notEqual(fork.threadId, sourceMeta.threadId);
-    const targetId = 'session:target:fork';
-    assert.ok((await get(targetId)).events.some((event) => event.type === 'fork' && event.sourceThreadId === sourceMeta.threadId));
-    assert.equal((await action({ action: 'clear_history', conversationId: targetId })).isError, true);
-    assert.equal(monitorPayload(await action({ action: 'close', threadId: fork.threadId })).closed, true);
-    assert.equal((await get(targetId)).conversation.status, 'closed');
-    assert.ok((await get(targetId)).events.some((event) => event.type === 'closed'));
-    assert.equal(monitorPayload(await action({ action: 'clear_history', conversationId: targetId })).deleted, true);
-    assert.equal((await srv.callTool('codex_ui_get_conversation', { conversationId: targetId })).isError, true);
-
-    const ephemeral = await run({});
-    assert.ok(!ephemeral.isError, toolText(ephemeral));
-    const listing = monitorPayload(await srv.callTool('codex_ui_list_conversations'));
-    assert.equal(listing.conversations[0].conversationId, 'session:source');
-    const ephemeralId = listing.conversations.find((entry) => entry.kind === 'ephemeral').conversationId;
-    assert.match(ephemeralId, /^ephemeral:/);
-    assert.equal(monitorPayload(await action({ action: 'clear_history', conversationId: ephemeralId })).deleted, true);
-    assert.equal((await srv.callTool('codex_ui_get_conversation', { conversationId: ephemeralId })).isError, true);
-  } finally {
-    await srv.stop();
-  }
-});
-
-await test('22. Monitor settings sync Codex config and models, validate writes, and evict warm workers', async () => {
-  const dir = path.join(TEST_WORK_DIR, 'monitor-settings');
-  mkdirSync(dir);
-  const initial = { model: 'mock-codex-pro', reasoningEffort: 'ultra' };
-  const env = monitorEnv(dir, {
-    CODEX_MODEL: undefined,
-    CODEX_REASONING_EFFORT: undefined,
+  const initial = { model: 'mock-codex-pro', reasoningEffort: 'low' };
+  const environment = { model: 'environment-model', reasoningEffort: 'minimal' };
+  const runtime = { model: 'mock-codex-fast', reasoningEffort: 'max' };
+  const resumedRuntime = { model: 'mock-codex-mini', reasoningEffort: 'high' };
+  const explicit = { model: 'explicit-model', reasoningEffort: 'xhigh' };
+  const rpcLog = path.join(dir, 'config-rpc.jsonl');
+  const env = settingsEnv(dir, {
     CODEX_WARM_IDLE_MS: '60000',
-    CODEX_HOME: path.join(dir, 'mock'),
+    CODEX_EOF_GRACE_MS: '6000',
+    CODEX_DISPOSE_GRACE_MS: '6000',
     MOCK_CODEX_CONFIG_MODEL: initial.model,
     MOCK_CODEX_CONFIG_EFFORT: initial.reasoningEffort,
+    MOCK_CODEX_CONFIG_RPC_LOG: rpcLog,
   });
-  const factory = {
-    version: 1, updatedAt: null,
-    roles: { gemini: { name: null, avatar: null }, codex: { name: null, avatar: null } },
-    codex: { model: null, reasoningEffort: null },
-  };
-  const { createSettingsStore, resolveIsolatedSettingsPath } = await import('../mcp/settings-store.mjs');
-  const settingsPath = resolveIsolatedSettingsPath(env.CODEX_SESSION_STORE_PATH);
-  assert.match(path.basename(settingsPath), /^sessions-[a-f0-9]{12}\.json$/);
-  assert.notEqual(settingsPath, resolveIsolatedSettingsPath(path.join(dir, 'sessions.db')));
-  const blockedDir = path.join(dir, 'blocked');
-  writeFileSync(blockedDir, 'not a directory');
-  const blockedStore = createSettingsStore(path.join(blockedDir, 'settings.json'));
-  assert.throws(() => blockedStore.update({ codex: { model: 'not-saved' } }));
-  assert.deepEqual(blockedStore.get(), factory);
-
   const configPath = path.join(env.MOCK_CODEX_STATE_DIR, 'mock-codex-config.json');
+  const codexToml = path.join(env.CODEX_HOME, 'config.toml');
   const writesPath = path.join(env.MOCK_CODEX_STATE_DIR, 'mock-config-writes.txt');
+  const rejectWrite = path.join(env.MOCK_CODEX_STATE_DIR, 'reject-config-write');
+  const mockRateLimitsPath = path.join(env.MOCK_CODEX_STATE_DIR, 'mock-rate-limits.json');
+  const rejectRateLimits = path.join(env.MOCK_CODEX_STATE_DIR, 'reject-rate-limits');
+  const rpcCalls = () => existsSync(rpcLog) ? readFileSync(rpcLog, 'utf8').trim().split('\n').map((entry) => JSON.parse(entry)) : [];
+  const methodsSince = (count) => rpcCalls().slice(count).map((entry) => entry.method);
+  const assertSyncCalls = (count) => {
+    const calls = rpcCalls().slice(count).map(({ method, cursor }) => `${method}:${cursor ?? ''}`).sort();
+    assert.deepEqual(calls, ['account/rateLimits/read:', 'config/read:', 'initialize:', 'model/list:', 'model/list:2']);
+  };
+  const writeCount = () => existsSync(writesPath) ? Number(readFileSync(writesPath, 'utf8')) : 0;
+  const nativeSettings = ({ model, reasoningEffort }) => ({ model, model_reasoning_effort: reasoningEffort });
   const readConfig = () => JSON.parse(readFileSync(configPath, 'utf8'));
-  const writeCount = () => Number(readFileSync(writesPath, 'utf8'));
-  const get = async (srv, args) => monitorPayload(await srv.callTool('codex_ui_get_settings', args));
-  const update = async (srv, patch) => monitorPayload(await srv.callTool('codex_ui_update_settings', patch));
+  const get = async (srv, args) => settingsPayload(await srv.callTool('codex_ui_get_settings', args));
+  const update = async (srv, patch) => settingsPayload(await srv.callTool('codex_ui_update_settings', patch));
+  const snapshotSettings = ({ codexConfig: { model, reasoningEffort } }) => ({ model, reasoningEffort });
   const run = async (srv, expected, overrides = {}) => {
     const { res } = await callAndWait(srv, {
       description: 'Settings runtime defaults', prompt: '{}', cwd: dir,
@@ -1893,17 +1683,20 @@ await test('22. Monitor settings sync Codex config and models, validate writes, 
     return { text, pid };
   };
 
-  let saved;
-  const runtime = { model: 'mock-codex-fast', reasoningEffort: 'max' };
-  const resumedRuntime = { model: 'mock-codex-mini', reasoningEffort: 'high' };
-  const explicit = { model: 'explicit-model', reasoningEffort: 'xhigh' };
-  const srv = startMcpServer(env);
+  const srv = startMcpServer({ ...env, CODEX_MODEL: environment.model, CODEX_REASONING_EFFORT: environment.reasoningEffort });
   try {
     const cached = await get(srv, { syncCodex: false });
-    assert.deepEqual(cached.settings, factory);
+    assert.deepEqual(Object.keys(cached), ['codexConfig', 'defaults', 'effective', 'options', 'limits', 'rateLimits']);
     assert.equal(cached.codexConfig.synced, false);
+    assert.equal(cached.rateLimits.available, false);
+    assert.deepEqual(cached.effective, environment);
     assert.deepEqual(cached.options.models, []);
-    assert.equal(existsSync(env.MOCK_CODEX_STATE_DIR), false, 'cached read must not spawn app-server');
+    assert.deepEqual(cached.limits, { maxModelLength: 128 });
+    for (const invalid of [{ syncCodex: 'false' }, { extra: true }]) {
+      assert.equal((await srv.callTool('codex_ui_get_settings', invalid)).isError, true);
+    }
+    assert.equal(existsSync(env.MOCK_CODEX_STATE_DIR), false);
+    assert.deepEqual(rpcCalls(), []);
 
     const synced = await get(srv);
     assert.equal(synced.codexConfig.synced, true);
@@ -1911,149 +1704,205 @@ await test('22. Monitor settings sync Codex config and models, validate writes, 
     assert.equal(synced.codexConfig.error, null);
     assert.equal(synced.codexConfig.catalogDefaultModel, initial.model);
     assert.equal(synced.codexConfig.catalogDefaultReasoningEffort, 'low');
-    assert.deepEqual(synced.settings.codex, initial);
-    assert.deepEqual(synced.defaults, { ...initial, envModel: null, envReasoningEffort: null });
-    assert.deepEqual(synced.effective, initial);
+    assert.deepEqual(snapshotSettings(synced), initial);
+    assert.deepEqual(synced.defaults, { ...initial, envModel: environment.model, envReasoningEffort: environment.reasoningEffort });
+    assert.deepEqual(synced.effective, environment);
     assert.deepEqual(synced.options.reasoningEfforts, ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
     assert.deepEqual(synced.options.models.map((entry) => entry.model), ['mock-codex-pro', 'mock-codex-fast', 'mock-codex-mini']);
-    const flagship = synced.options.models[0];
-    assert.equal(flagship.displayName, 'Mock Codex Pro');
-    assert.equal(flagship.isDefault, true);
-    assert.deepEqual(flagship.supportedReasoningEfforts.slice(-2), [
-      { reasoningEffort: 'max', description: 'Maximum reasoning' },
-      { reasoningEffort: 'ultra', description: 'Maximum with delegation' },
-    ]);
+    assert.equal(synced.options.models[0].displayName, 'Mock Codex Pro');
+    assertSyncCalls(0);
+    const rateLimits = synced.rateLimits;
+    assert.equal(rateLimits.available, true);
+    assert.equal(rateLimits.planType, 'plus');
+    assert.equal(rateLimits.ordinaryUsageAllowed, true);
+    assert.equal(rateLimits.windows.length, 2);
+    const [{ resetsAt: fiveHourReset, ...fiveHour }, { resetsAt: weeklyReset, ...weekly }] = rateLimits.windows;
+    assert.deepEqual(fiveHour, { kind: 'five_hour', usedPercent: 18, remainingPercent: 82, windowDurationMins: 300 });
+    assert.deepEqual(weekly, { kind: 'weekly', usedPercent: 94, remainingPercent: 6, windowDurationMins: 10080 });
+    assert.ok(Number.isInteger(fiveHourReset) && fiveHourReset > 0);
+    assert.ok(Number.isInteger(weeklyReset) && weeklyReset > 0);
+    assert.deepEqual(rateLimits.credits, { hasCredits: false, unlimited: false, balance: '0' });
+    assert.equal(rateLimits.spendControlReached, false);
+    assert.equal(rateLimits.rateLimitReachedType, null);
+    assert.equal(rateLimits.error, null);
+    assert.equal(new Date(rateLimits.updatedAt).toISOString(), rateLimits.updatedAt);
+    for (const key of ['accountId', 'email', 'rateLimitResetCredits', 'rateLimitUpsell']) {
+      assert.equal(Object.hasOwn(rateLimits, key), false);
+    }
+    assert.equal(JSON.stringify(synced).includes('mock-account-id-must-strip'), false);
+    assert.equal(JSON.stringify(synced).includes('mock-reset-credit-1'), false);
 
-    const external = { model: 'mock-codex-pro', model_reasoning_effort: 'medium' };
-    writeFileSync(configPath, JSON.stringify(external));
-    assert.deepEqual((await get(srv, { syncCodex: false })).settings.codex, initial);
-    assert.equal((await get(srv, { syncCodex: true })).codexConfig.reasoningEffort, 'medium');
+    const external = { model: 'mock-codex-fast', reasoningEffort: 'medium' };
+    writeFileSync(configPath, JSON.stringify(nativeSettings(external)));
+    const beforeResync = rpcCalls().length;
+    assert.deepEqual(await get(srv, { syncCodex: false }), synced);
+    assert.equal(rpcCalls().length, beforeResync);
+    const resynced = await get(srv, { syncCodex: true });
+    assert.deepEqual(snapshotSettings(resynced), external);
+    assertSyncCalls(beforeResync);
 
-    const preset = { type: 'preset', value: 'spark' };
-    const codexAvatar = { type: 'preset', value: 'terminal' };
-    const first = await update(srv, {
-      roles: { gemini: { name: '  Ge\u0000mini\u200B  ', avatar: preset }, codex: { name: 'Codex', avatar: codexAvatar } },
-      codex: { model: ' mock-codex-fast ', reasoningEffort: ' max ' },
-    });
-    assert.deepEqual(first.settings.roles, { gemini: { name: 'Gemini', avatar: preset }, codex: { name: 'Codex', avatar: codexAvatar } });
-    assert.deepEqual(first.settings.codex, runtime);
-    assert.deepEqual(first.effective, runtime);
-    assert.equal(first.codexConfig.model, runtime.model);
-    assert.equal(first.codexConfig.reasoningEffort, runtime.reasoningEffort);
-    assert.equal(first.codexConfig.catalogDefaultReasoningEffort, 'medium');
-    assert.equal(Object.hasOwn(first.codexConfig, 'filePath'), false);
-    assert.equal(JSON.stringify(first).includes('mock-codex-config.json'), false);
-    assert.equal(new Date(first.settings.updatedAt).toISOString(), first.settings.updatedAt);
-    assert.deepEqual(readConfig(), { model: runtime.model, model_reasoning_effort: runtime.reasoningEffort });
+    await run(srv, environment);
+    const pinned = { sessionKey: 'unchanged-signature', ...explicit };
+    const pinnedBefore = await run(srv, explicit, pinned);
+    assert.equal((await run(srv, explicit, pinned)).pid, pinnedBefore.pid);
+    const beforeWrite = rpcCalls().length;
+    const firstWrite = await update(srv, { codex: { model: ' mock-codex-fast ', reasoningEffort: ' max ' } });
+    assert.deepEqual(firstWrite.effective, runtime);
+    assert.deepEqual(snapshotSettings(firstWrite), runtime);
+    assert.deepEqual(firstWrite.rateLimits, resynced.rateLimits);
+    assert.equal(firstWrite.codexConfig.catalogDefaultReasoningEffort, 'medium');
+    assert.equal(JSON.stringify(firstWrite).includes(path.basename(configPath)), false);
+    assert.deepEqual(readConfig(), nativeSettings(runtime));
     assert.equal(writeCount(), 1);
-    await update(srv, { codex: runtime });
-    assert.equal(writeCount(), 1, 'unchanged values must not be written again');
+    assert.deepEqual(methodsSince(beforeWrite), ['initialize', 'config/batchWrite', 'config/read']);
+    assert.notEqual((await run(srv, explicit, pinned)).pid, pinnedBefore.pid, 'evict even when the worker signature did not change');
 
-    const firstRun = await run(srv, runtime);
-    assert.equal((await run(srv, runtime)).pid, firstRun.pid, 'worker should be warm before settings change');
-    await update(srv, { codex: resumedRuntime });
+    const live = await run(srv, runtime);
+    assert.match(live.text, /resumed=true/);
+    const beforeUnchanged = rpcCalls().length;
+    assert.deepEqual(await update(srv, { reset: false, codex: runtime }), firstWrite);
+    assert.equal(writeCount(), 1);
+    assert.deepEqual(methodsSince(beforeUnchanged), []);
+    assert.equal((await run(srv, runtime)).pid, live.pid, 'unchanged settings keep the warm worker');
+
+    const beforeSecondWrite = rpcCalls().length;
+    const secondWrite = await update(srv, { codex: resumedRuntime });
+    assert.deepEqual(secondWrite.rateLimits, resynced.rateLimits);
+    assert.deepEqual(methodsSince(beforeSecondWrite), ['initialize', 'config/batchWrite', 'config/read']);
     const resumed = await run(srv, resumedRuntime);
     assert.match(resumed.text, /resumed=true/);
-    assert.notEqual(resumed.pid, firstRun.pid);
-    assert.equal((await run(srv, resumedRuntime)).pid, resumed.pid, 'eviction must leave the pool enabled');
+    assert.notEqual(resumed.pid, live.pid);
+    assert.equal((await run(srv, resumedRuntime)).pid, resumed.pid);
     await run(srv, explicit, explicit);
+    const beforeFailureWorker = await run(srv, resumedRuntime);
 
-    const writesBeforeRoles = writeCount();
-    const emoji = { type: 'emoji', value: '\u{1F469}\u200D\u2695\uFE0F' };
-    assert.deepEqual((await update(srv, {
-      roles: { gemini: { avatar: { ...emoji, value: ' \u200B' + emoji.value + '\n ' } } },
-    })).settings.roles.gemini.avatar, emoji);
-    const image = { type: 'image', value: 'data:image/png;base64,' + PNG_1X1_BASE64 };
-    assert.deepEqual((await update(srv, { roles: { gemini: { avatar: image } } })).settings.roles.gemini.avatar, image);
-    assert.equal(writeCount(), writesBeforeRoles, 'roles-only updates must not write Codex config');
     const beforeInvalid = await get(srv, { syncCodex: false });
-    saved = { ...beforeInvalid.settings, codex: factory.codex };
-    const savedSettingsText = readFileSync(settingsPath, 'utf8');
-    const savedConfigText = readFileSync(configPath, 'utf8');
-    assert.deepEqual(JSON.parse(savedSettingsText), saved);
-    const invalidAvatars = [
-      { type: 'image', value: 'data:image/svg+xml;base64,AAAA' },
-      { type: 'image', value: 'https://example.com/a.png' },
-      { type: 'image', value: 'data:image/png;base64,' + 'A'.repeat(65536) },
-      { type: 'image', value: 'data:image/png;base64,A===' },
-      { type: 'preset', value: 'unknown' }, { type: 'preset' }, { type: 'preset', value: 'spark', extra: true },
-      { type: 'emoji', value: '\u200B' }, { type: 'emoji', value: '\u2764'.repeat(12) },
-    ];
+    const beforeInvalidCalls = rpcCalls().length;
     for (const patch of [
-      ...invalidAvatars.map((avatar) => ({ roles: { gemini: { avatar } }, codex: runtime })),
-      { reset: 'true' }, { roles: [] }, { codex: null }, { codex: { reasoningEffort: 'bogus' } },
-      { roles: { gemini: { name: 'x'.repeat(41) } }, codex: runtime }, { codex: { model: 'two words' } },
-      { reset: true, codex: { reasoningEffort: 'bogus' } },
-      { unknown: true }, { roles: { other: {} } }, { roles: { gemini: { unknown: true } } }, { codex: { unknown: true } },
+      null, [], true, { roles: {} }, { unknown: true }, { reset: 'true' }, { codex: null }, { codex: [] },
+      { codex: { unknown: true } }, { codex: { model: 42 } }, { codex: { model: 'has space' } },
+      { codex: { model: 'control\u0000character' } }, { codex: { model: 'format\u200Bcharacter' } },
+      { codex: { model: 'm'.repeat(129) } }, { codex: { reasoningEffort: true } },
+      { reset: true, codex: { reasoningEffort: 'not-in-catalog' } },
     ]) {
-      assert.equal((await srv.callTool('codex_ui_update_settings', patch)).isError, true);
+      assert.equal((await srv.callTool('codex_ui_update_settings', patch)).isError, true, JSON.stringify(patch));
     }
+    assert.deepEqual(methodsSince(beforeInvalidCalls), []);
     assert.deepEqual(await get(srv, { syncCodex: false }), beforeInvalid);
-    assert.equal(readFileSync(settingsPath, 'utf8'), savedSettingsText);
-    assert.equal(readFileSync(configPath, 'utf8'), savedConfigText);
-    assert.equal(writeCount(), writesBeforeRoles);
+    assert.deepEqual(readConfig(), nativeSettings(resumedRuntime));
+    assert.equal(writeCount(), 2);
+
+    writeFileSync(rejectWrite, '');
+    const beforeFailure = rpcCalls().length;
+    const failed = await srv.callTool('codex_ui_update_settings', { codex: runtime });
+    assert.equal(failed.isError, true);
+    assert.match(toolText(failed), /mock config write error/);
+    assert.deepEqual(methodsSince(beforeFailure), ['initialize', 'config/batchWrite']);
+    assert.deepEqual(await get(srv, { syncCodex: false }), beforeInvalid);
+    assert.deepEqual(readConfig(), nativeSettings(resumedRuntime));
+    assert.equal(writeCount(), 2);
+    assert.equal((await run(srv, resumedRuntime)).pid, beforeFailureWorker.pid);
+    rmSync(rejectWrite);
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    try {
+      writeFileSync(mockRateLimitsPath, JSON.stringify({
+        planType: 'pro', primary: { usedPercent: 32, windowDurationMins: 10080, resetsAt: nowSec + 86400 }, secondary: null,
+      }));
+      const proWeekly = (await get(srv)).rateLimits;
+      assert.equal(proWeekly.planType, 'pro');
+      assert.equal(proWeekly.windows.length, 1);
+      assert.equal(proWeekly.windows[0].kind, 'weekly');
+      assert.equal(proWeekly.windows[0].remainingPercent, 68);
+
+      writeFileSync(mockRateLimitsPath, JSON.stringify({
+        planType: 'pro', primary: { usedPercent: 0, windowDurationMins: 300 }, secondary: { usedPercent: 40, windowDurationMins: 10080 },
+      }));
+      const proWithFiveHour = (await get(srv)).rateLimits;
+      assert.equal(proWithFiveHour.windows.length, 1);
+      assert.equal(proWithFiveHour.windows[0].kind, 'weekly');
+      assert.equal(proWithFiveHour.windows[0].remainingPercent, 60);
+    } finally {
+      rmSync(mockRateLimitsPath, { force: true });
+    }
+
+    writeFileSync(rejectRateLimits, '');
+    try {
+      const beforeUnavailable = rpcCalls().length;
+      const unavailable = await get(srv);
+      assertSyncCalls(beforeUnavailable);
+      assert.equal(unavailable.codexConfig.synced, true);
+      assert.equal(unavailable.codexConfig.catalogAvailable, true);
+      assert.equal(unavailable.codexConfig.error, null);
+      assert.equal(unavailable.rateLimits.available, false);
+      assert.match(unavailable.rateLimits.error, /mock rate limits unavailable/);
+    } finally {
+      rmSync(rejectRateLimits);
+    }
+
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    stdin.on('data', (chunk) => {
+      const request = JSON.parse(chunk.toString());
+      if (request.id !== undefined) stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: {} }) + '\n');
+    });
+    const exit = Promise.withResolvers();
+    let terminated = false;
+    const mockChild = {
+      stdin, stdout, pid: 1, done: exit.promise,
+      terminate: () => { terminated = true; exit.resolve({ code: 0 }); },
+      waitForExit: (signal) => {
+        assert.equal(stdin.writableEnded, true);
+        return terminated ? Promise.resolve(false)
+          : new Promise((resolve) => signal.addEventListener('abort', () => resolve(false), { once: true }));
+      },
+    };
+    const start = performance.now();
+    await assert.rejects(clientMod.writeCodexUserConfig({
+      spawn: () => mockChild, argv: ['mock'], cwd: dir, model: runtime.model, eofGraceMs: 6000, disposeGraceMs: 6000,
+    }), (error) => error.facts?.stage === 'teardown' && /disposeGraceMs=2000/.test(error.cause?.message));
+    assert.ok(performance.now() - start < 4000, 'config RPC teardown must not wait for the full EOF grace');
   } finally {
     await srv.stop();
   }
 
-  const failing = startMcpServer({ ...env, MOCK_CODEX_CONFIG_WRITE_FAIL: '1' });
-  try {
-    const savedSettingsText = readFileSync(settingsPath, 'utf8');
-    const savedConfigText = readFileSync(configPath, 'utf8');
-    const writesBeforeFailure = writeCount();
-    const failed = await failing.callTool('codex_ui_update_settings', {
-      codex: runtime,
-      roles: { codex: { name: 'Unsaved' } },
-    });
-    assert.equal(failed.isError, true);
-    assert.match(toolText(failed), /mock config write error/);
-    assert.deepEqual((await get(failing, { syncCodex: false })).settings, saved);
-    assert.equal(readFileSync(settingsPath, 'utf8'), savedSettingsText);
-    assert.equal(readFileSync(configPath, 'utf8'), savedConfigText);
-    assert.equal(writeCount(), writesBeforeFailure);
-  } finally {
-    await failing.stop();
-  }
-
   const restarted = startMcpServer(env);
   try {
-    // Native defaults apply immediately after restart, even without a Monitor sync.
-    const nativeSession = { sessionKey: 'native-after-restart' };
-    const native = await run(restarted, resumedRuntime, nativeSession);
-    assert.equal((await run(restarted, resumedRuntime, nativeSession)).pid, native.pid);
-    const codexToml = path.join(env.CODEX_HOME, 'config.toml');
-    writeFileSync(codexToml, 'model_reasoning_effort = "medium"\n');
-    writeFileSync(configPath, JSON.stringify({ model: resumedRuntime.model, model_reasoning_effort: 'medium' }));
-    const refreshed = await run(restarted, { ...resumedRuntime, reasoningEffort: 'medium' }, nativeSession);
-    assert.notEqual(refreshed.pid, native.pid, 'config.toml mtime must invalidate the warm worker');
-    assert.deepEqual((await get(restarted)).settings.roles, saved.roles);
+    assert.equal((await get(restarted, { syncCodex: false })).codexConfig.synced, false);
+    const session = { sessionKey: 'native-after-restart' };
+    const native = await run(restarted, resumedRuntime, session);
+    assert.equal((await run(restarted, resumedRuntime, session)).pid, native.pid);
+    assert.deepEqual(snapshotSettings(await get(restarted)), resumedRuntime);
 
+    const refreshed = { ...resumedRuntime, reasoningEffort: 'medium' };
+    writeFileSync(configPath, JSON.stringify(nativeSettings(refreshed)));
+    writeFileSync(codexToml, 'model_reasoning_effort = "medium"\n');
+    const afterMtimeChange = await run(restarted, refreshed, session);
+    assert.notEqual(afterMtimeChange.pid, native.pid, 'config.toml mtime must invalidate a matching worker');
+    assert.deepEqual(snapshotSettings(await get(restarted)), refreshed);
+
+    const cleared = await update(restarted, { codex: { reasoningEffort: '  ' } });
+    assert.deepEqual(snapshotSettings(cleared), { model: refreshed.model, reasoningEffort: null });
+    assert.equal(writeCount(), 3);
+    assert.equal((await update(restarted, { codex: { model: null } })).codexConfig.model, null);
+    assert.equal(writeCount(), 4);
+    await update(restarted, { codex: runtime });
+    const resetSession = { sessionKey: 'reset-eviction', ...explicit };
+    const beforeResetWorker = await run(restarted, explicit, resetSession);
+    const beforeReset = rpcCalls().length;
     const reset = await update(restarted, { reset: true });
-    assert.ok(reset.settings.updatedAt);
-    assert.deepEqual({ ...reset.settings, updatedAt: null }, factory);
+    assert.equal(writeCount(), 6);
     assert.deepEqual(readConfig(), { model: null, model_reasoning_effort: null });
+    assert.deepEqual(snapshotSettings(reset), { model: null, reasoningEffort: null });
     assert.equal(reset.codexConfig.synced, true);
-    assert.deepEqual(reset.effective, { model: initial.model, reasoningEffort: 'low' });
+    assert.deepEqual(reset.effective, initial);
+    assert.equal(reset.rateLimits.available, true);
+    assert.deepEqual(methodsSince(beforeReset).slice(0, 3), ['initialize', 'config/batchWrite', 'config/read']);
+    assertSyncCalls(beforeReset + 3);
+    assert.notEqual((await run(restarted, explicit, resetSession)).pid, beforeResetWorker.pid);
     await run(restarted, { model: 'mock-codex-model', reasoningEffort: null }, { sessionKey: 'fresh-after-reset' });
   } finally {
     await restarted.stop();
-  }
-
-  const invalidFiles = [
-    '{ broken', JSON.stringify({ ...saved, version: 2 }), JSON.stringify({ ...saved, updatedAt: 'yesterday' }),
-    JSON.stringify({ ...saved, codex: { model: 'two words', reasoningEffort: null } }),
-  ];
-  for (const invalid of invalidFiles) {
-    writeFileSync(settingsPath, invalid);
-    const recovered = startMcpServer(env);
-    try {
-      assert.deepEqual((await get(recovered, { syncCodex: false })).settings, factory);
-      const repaired = await update(recovered, { roles: { codex: { name: 'Recovered' } } });
-      assert.equal(repaired.settings.roles.codex.name, 'Recovered');
-      assert.deepEqual(JSON.parse(readFileSync(settingsPath, 'utf8')), repaired.settings);
-    } finally {
-      await recovered.stop();
-    }
   }
 });
 

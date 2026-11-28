@@ -6,9 +6,9 @@
 
 [English](./README.md) | **简体中文**
 
-面向 **Antigravity** 的独立 Node.js stdio MCP 服务器与 **MCP App 可视化插件**，通过 `@openai/codex` 官方 `app-server --stdio` JSON-RPC v2 协议将编码、排查或分析任务委托给独立的 OpenAI Codex 子代理执行，并内置可视化的 **Codex 监工台（Codex Monitor）**（支持侧边辅助面板 `+` 菜单和左侧全局导航栏）。
+面向 **Antigravity** 的独立 Node.js stdio MCP 服务器与 **MCP App 配置插件**，通过 `@openai/codex` 官方 `app-server --stdio` JSON-RPC v2 协议将编码、排查或分析任务委托给独立的 OpenAI Codex 子代理执行，并在左侧导航栏提供与 `~/.codex/config.toml` 双向同步的 **Codex 默认配置**面板。
 
-支持跨轮持久会话（`sessionKey` / `threadId`）、Gemini ↔ Codex 实时双边对话与遥测时间线、UI 界面实时纠偏（`steer`）、点击变更文件直达侧栏源码视图、协议级沙箱切换（`read-only` / `workspace-write` / `danger-full-access`）、本地多模态图片输入（`images`）、JSON Schema 结构化输出约束（`outputSchema`）、MCP `notifications/progress` 通知、上下文原地压缩（`compact`）、会话分叉（`fork`）、崩溃/重启恢复，以及按需开启的温池保活（Warm Worker Pool）。
+支持跨轮持久会话（`sessionKey` / `threadId`）、实时执行遥测、运行中纠偏（`steer`）、协议级沙箱切换（`read-only` / `workspace-write` / `danger-full-access`）、本地多模态图片输入（`images`）、JSON Schema 结构化输出约束（`outputSchema`）、MCP `notifications/progress` 通知、上下文原地压缩（`compact`）、会话分叉（`fork`）、崩溃/重启恢复，以及按需开启的温池保活（Warm Worker Pool）。
 
 ## 前置要求
 
@@ -44,27 +44,27 @@
   - **线程生命周期管理**：支持原地压缩（`action: "compact"`）、会话分叉（`action: "fork"`，需传 `targetSessionKey`，可选 `lastTurnId`）以及归档清理（`action: "close"`）。
 - `subagent_codex_wait`：当 `subagent_codex` 超出同步等待窗口返回 `status: "running"`、`jobId` 及实时 `telemetry`（包含 `turnId`、`phase`、`lastActivityAt`、单调递增的 `idleMs`、`currentActivity`、`activeCount`、5 条 `recentActivities` 环形缓冲、`plan`、`diffSummary`、`tokenUsage`）时，继续轮询等待、运行中纠偏（`steer` + 可选 `images`）或取消任务。尚未认领的已结束任务回执会原子持久化到隔离的目录（`data/jobs/<store>-<hash>/<jobId>.json`，保留 30 分钟），确保跨越 MCP 服务重启仍可找回结果；当请求附带 `_meta.progressToken` 时还会按节流周期发送 MCP `notifications/progress`。
 - `subagent_codex_list_sessions`：查看所有持久化 Codex 会话（`sessions`，含 `used` 与 `contextWindow`）以及运行中或待认领的后台任务（`activeJobs`，含实时遥测与磁盘恢复的待认领回执）。
-- `subagent_codex_monitor`：唤出内置的 Antigravity **MCP App** 可视化监工台（`ui://codex-subagent/monitor.html`），也可直接从 Antigravity 右侧辅助面板的 **`+` 菜单**（`Codex Monitor`）或**左侧主导航栏**（`Codex Subagent`）无参启动。面板交互由 4 个仅对 UI 开放、对 Gemini 隐藏（`visibility: ["app"]`）的工具驱动（`codex_ui_list_conversations`、`codex_ui_get_conversation`、`codex_ui_steer`、`codex_ui_action`），既可实时观测过程与控制任务，又不会污染主对话上下文。
+- `subagent_codex_settings`：打开内置的 Antigravity **MCP App** 默认配置面板（`ui://codex-subagent/settings.html`），也可直接从 Antigravity **左侧主导航栏**（`Codex Subagent`）无参启动。面板由 2 个仅对 UI 开放、对模型隐藏（`visibility: ["app"]`）的工具驱动（`codex_ui_get_settings`、`codex_ui_update_settings`），不占用主对话上下文。
 
-## Codex 监工台可视化界面（`v0.5.0`）
+## Codex 默认配置面板
 
-在右侧辅助面板点击 **`+`** 菜单选择 **Codex Monitor**（单会话侧边栏），或在左侧导航栏点击 **Codex Subagent**（全局多会话管理视图）：
+在左侧导航栏点击 **Codex Subagent** 打开配置面板：
 
-- **Gemini ↔ Codex 双边对话时间轴**：直观呈现派单 Prompt 与沙箱/模型/推理深度徽章、执行计划勾选清单、可折叠的推理思考与终端命令输出流、Unified Diff 预览、行内纠偏气泡，以及 Markdown 渲染的 Codex 最终答复。
-- **心跳与上下文水位条**：实时展示执行阶段（思考中/执行命令/输出中）、耗时与心跳 `idleMs`，并在 Token 占用达到 `>= 80%` 时显示黄色告警与快捷**「立即压缩」**按钮。
-- **UI 直接控场**：看 Codex 跑偏时可直接在底部发送纠偏指令（`Steer`）或**强停任务**（不抢占 Gemini 对后台回执的认领权）；闲置持久会话可一键执行**压缩上下文**、**分叉会话（Fork）**、**归档关闭**或**清理历史**。
-- **Antigravity 原生联动**：点击 Diff 中受影响的工作区文件可直接在侧边栏打开源码（`com.google.antigravity/toggle-aux-pane`），也可按当前宿主能力一键将 Codex 结论**引用或发回 Gemini**；界面自动适配深浅色主题与中英文环境。
+- **`~/.codex/config.toml` 双向同步**：直接通过 Codex 的 `config/read` 与 `config/batchWrite` 接口读写默认模型（`model`）与思考强度（`model_reasoning_effort`），保存后同步生效于本插件后续任务（并自动失效旧温池 worker）以及 Codex CLI/桌面端本身。
+- **同步 Codex 模型列表与推理强度**：动态拉取 Codex 可用模型目录（`model/list`）与每个模型对应的 `supportedReasoningEfforts`（切换模型时自动收敛不受支持的思考强度），同时支持切换为手动输入自定义模型 ID。
+- **实时账户额度余量条**：通过 `account/rateLimits/read` 同步当前账号剩余额度与重置时间，进度条随用量平滑渐变配色，并按套餐自动适配展示窗口（Plus 展示 5 小时与每周限额；Pro 套餐无 5 小时限制，仅展示每周限额）。
+- **配置覆盖提示与一键重置**：检测到 `mcp_config.json` 环境变量覆盖或更高层 Codex 配置覆盖时自动提醒；自动适配 Antigravity 深浅色主题与中英文环境，并支持一键恢复默认配置。
 
 ## 配置说明（`mcp_config.json` `env`）
 
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `CODEX_MODEL` | 未设置（继承 `~/.codex/config.toml`） | 新建会话的默认 Codex 模型；恢复既有会话时优先保留原会话模型，除非单次调用显式指定 `model`。 |
-| `CODEX_REASONING_EFFORT` | 未设置（继承 `~/.codex/config.toml`） | 可选默认推理强度（`low`、`medium`、`high`、`xhigh`）。 |
+| `CODEX_MODEL` | 未设置（继承 `~/.codex/config.toml`） | 可选默认 Codex 模型覆盖；恢复既有会话时优先保留原会话模型，除非单次显式传参或在配置面板实时修改。 |
+| `CODEX_REASONING_EFFORT` | 未设置（继承 `~/.codex/config.toml`） | 可选默认推理强度（`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`）。 |
 | `CODEX_DEFAULT_WAIT_MS` | `120000` | 返回 `status: "running"` 前的默认同步等待窗口（毫秒，范围 `1000..150000`）。 |
 | `CODEX_PERMISSION_MODE` | `never` | 默认审批/沙箱预设（`never`、`read-only`、`approve-for-me`、`dangerously-bypass-approvals-and-sandbox`）。 |
 | `CODEX_SANDBOX` | 未设置 | 可选默认沙箱覆盖（`read-only`、`workspace-write`、`danger-full-access`）。 |
-| `CODEX_WARM_IDLE_MS` | 代码默认 `0`（默认 `mcp_config.json` 为 `180000`） | 按需开启的 `app-server` 温池空闲存活时间（毫秒）。设为 `0` 时每轮冷启动新进程；`> 0` 时，连续持久会话在 `(cwd, permissionMode, sandbox, model, config)` 一致时复用已初始化的 worker，配置变化、空闲超时、`compact`/`fork`、`close` 或进程退出时自动安全回收。 |
+| `CODEX_WARM_IDLE_MS` | 代码默认 `0`（默认 `mcp_config.json` 为 `180000`） | 按需开启的 `app-server` 温池空闲存活时间（毫秒）。设为 `0` 时每轮冷启动新进程；`> 0` 时，连续持久会话在 `(cwd, permissionMode, sandbox, model, config)` 与 `config.toml` 修改时间一致时复用已初始化的 worker，配置变化、空闲超时、`compact`/`fork`、`close` 或进程退出时自动安全回收。 |
 | `CODEX_EOF_GRACE_MS` | `6000` | 关闭 stdin 后等待子进程自行退出的宽限时间（毫秒）。 |
 | `CODEX_DISPOSE_GRACE_MS` | `3000` | 强制终止子进程树后等待退出收敛的宽限时间（毫秒）。 |
 | `CODEX_REQUEST_TIMEOUT_MS` | `30000` | 单次 JSON-RPC 请求超时时间（毫秒，作用于 `codex-wire.mjs`）。 |
@@ -75,20 +75,19 @@
 | `CODEX_WRAPPER_PATH` | 自动探测 | 可选显式指定 `@openai/codex/bin/codex.js` 路径；未设置时按顺序自动探测本地 `node_modules`、标准全局 npm 目录以及可选 DSH 配置目录。 |
 | `CODEX_ANCHOR_PATH` | 未设置 | 解析 `@openai/codex` 依赖时的可选附加搜索目录。 |
 | `CODEX_HOME` | 未设置 | 可选覆盖 Codex CLI 的主目录。 |
-| `CODEX_MONITOR_HTML` | `<plugin>/ui/dist/monitor.html` | 可选指定 MCP App 监控面板 HTML 路径（每次 `resources/read` 实时读取，便于本地开发调试 UI）。 |
+| `CODEX_SETTINGS_HTML` | `<plugin>/ui/dist/settings.html` | 可选指定 MCP App 默认配置面板 HTML 路径（当文件 `mtimeMs` 或体积变化时自动重新读取）。 |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` | 未设置（继承宿主环境） | 可选代理环境变量，会透传给启动的 `codex app-server` 子进程。 |
 
 ## 架构概览
 
-- `mcp/server.mjs`：MCP stdio JSON-RPC 服务入口、MCP App 资源与视图入口注册（`ui://`）、工具 Schema 定义、后台任务调度、遥测聚合与温池协调。
-- `mcp/codex-wire.mjs`：`@openai/codex app-server --stdio` JSON-RPC v2 帧解析、流式增量心跳、仅供 UI 消费的增量/Diff/操作明细事件、`plan`/`diff` 节流合并及线程/轮次 RPC 封装。
-- `mcp/codex-client.mjs`：子进程生命周期管理、`@openai/codex` 路径解析、线程配置校验、rollout JSONL 完整性核验、温池、`compact` 与 `fork` 实现。
+- `mcp/server.mjs`：MCP stdio JSON-RPC 服务入口、MCP App 配置面板资源与入口注册（`ui://`）、工具 Schema 定义、后台任务调度、遥测聚合与温池协调。
+- `mcp/codex-wire.mjs`：`@openai/codex app-server --stdio` JSON-RPC v2 帧解析、流式增量心跳、`plan`/`diff` 节流合并、配置/模型目录 RPC 及线程/轮次 RPC 封装。
+- `mcp/codex-client.mjs`：子进程生命周期管理、`@openai/codex` 路径解析、Codex 全局配置与模型目录双向同步、线程配置校验、rollout JSONL 完整性核验、温池、`compact` 与 `fork` 实现。
 - `mcp/session-store.mjs`：带独占 `.lock` 保护的持久化会话注册表、`uncertain` 状态协调与原子 `fork`/租约事务。
 - `mcp/disk-job-store.mjs`：按 store 隔离的磁盘任务回执存储及跨 MCP 重启的原子单次认领恢复。
-- `mcp/transcript-store.mjs`：按 store 隔离的 UI 对话记录存储（`data/transcripts/`）、单调递增 `afterSeq` 增量拉取合并以及敏感凭据正则脱敏（`redactSecrets`）。
 - `mcp/local-path-guard.mjs`：路径、重解析点、UNC/设备命名空间、网络驱动器防护与本地多模态图片校验。
 - `mcp/subprocess-adapter.mjs`：跨平台子进程启动、管道排空与进程树终止适配（Windows 下使用 `taskkill /T /F`）。
-- `ui/`：基于 `@modelcontextprotocol/ext-apps` 构建的 MCP App 前端源码，经 `esbuild` 打包为单文件 `ui/dist/monitor.html`（运行时零第三方 npm 依赖）。
+- `ui/`：基于 `@modelcontextprotocol/ext-apps` 构建的 MCP App 配置面板前端源码，经 `esbuild` 打包为单文件 `ui/dist/settings.html`（运行时零第三方 npm 依赖）。
 
 ## 测试
 
@@ -98,7 +97,7 @@
 npm run test:unit
 ```
 
-如需修改 `ui/src/` 下前端代码并重新打包单文件 `ui/dist/monitor.html`（需先执行 `npm install` 安装 `devDependencies`）：
+如需修改 `ui/src/` 下前端代码并重新打包单文件 `ui/dist/settings.html`（需先执行 `npm install` 安装 `devDependencies`）：
 
 ```bash
 npm run build:ui
