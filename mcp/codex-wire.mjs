@@ -298,6 +298,7 @@ export function createCodexWire({
   let lastFinalAnswer;
   let lastPartialAnswer;
   let lastUnphasedAnswer;
+  const selectedAnswer = () => lastFinalAnswer ?? lastPartialAnswer ?? lastUnphasedAnswer;
   let latestUsage;
   let diagnostic;
   let diagnosticOrder = 0;
@@ -601,13 +602,15 @@ export function createCodexWire({
         });
       }
       if (typeof params.delta === 'string' && params.delta.length > 0) {
+        const limit = 8192;
+        const end = params.delta.codePointAt(limit - 1) > 0xffff ? limit - 1 : limit;
         const streamEvent = {
           type: 'streamDelta',
           channel: STREAM_CHANNEL_BY_PHASE[heartbeatPhase],
           threadId: activeThreadId,
           turnId: activeTurnId ?? id,
           itemId: typeof params.itemId === 'string' && params.itemId ? params.itemId : null,
-          delta: params.delta.slice(0, 8192),
+          delta: params.delta.slice(0, end),
         };
         if (activeTurnId !== undefined) emitDiagnostic(streamEvent);
         else if (earlyStreamNotifications.length < MAX_EARLY_TURN_NOTIFICATIONS) {
@@ -769,7 +772,8 @@ export function createCodexWire({
       if (id !== activeTurnId) return;
       const item = requireObject(params.item, 'item/completed item');
       const kind = extractActivityKind(item);
-      if (kind !== null && typeof item.id === 'string' && item.id.length > 0) {
+      const hasItemId = typeof item.id === 'string' && item.id.length > 0;
+      if (kind !== null && hasItemId) {
         emitDiagnostic({
           type: 'activity',
           threadId: activeThreadId,
@@ -781,6 +785,12 @@ export function createCodexWire({
         emitDiagnostic({
           type: 'activityDetail', threadId: activeThreadId, turnId: activeTurnId,
           itemId: item.id, kind, phase: 'completed', summary: summarizeActivity(item),
+        });
+      }
+      if (hasItemId) {
+        emitDiagnostic({
+          type: 'itemCompleted', threadId: activeThreadId, turnId: activeTurnId,
+          itemId: item.id, itemType: item.type, phase: item.phase ?? null,
         });
       }
       if (recordDeclinedItem(item, order)) return;
@@ -797,11 +807,19 @@ export function createCodexWire({
       if (typeof item.text !== 'string') {
         throw new Error('subagent-codex: app-server returned an invalid agent message');
       }
-      if (item.phase === 'final_answer') lastFinalAnswer = item.text;
-      else if (item.phase === 'partial_answer') lastPartialAnswer = item.text;
-      else if (item.phase === null || item.phase === undefined) lastUnphasedAnswer = item.text;
+      const previous = selectedAnswer();
+      const answer = { text: item.text, itemId: hasItemId ? item.id : null, phase: item.phase ?? null };
+      if (item.phase === 'final_answer') lastFinalAnswer = answer;
+      else if (item.phase === 'partial_answer') lastPartialAnswer = answer;
+      else if (item.phase === null || item.phase === undefined) lastUnphasedAnswer = answer;
       else if (item.phase !== 'commentary') {
         throw new Error(`subagent-codex: app-server returned an unknown agent message phase ${JSON.stringify(item.phase)}`);
+      }
+      if (selectedAnswer() !== previous) {
+        emitDiagnostic({
+          type: 'answerItemSelected', threadId: activeThreadId, turnId: activeTurnId,
+          itemId: answer.itemId, phase: answer.phase,
+        });
       }
       return;
     }
@@ -1064,7 +1082,7 @@ export function createCodexWire({
   };
 
   const collectOutput = () => {
-    const selected = lastFinalAnswer ?? lastPartialAnswer ?? lastUnphasedAnswer;
+    const selected = selectedAnswer()?.text;
     return selected !== undefined && selected.trim().length > 0
       ? [{ type: 'text', text: selected }]
       : [];
@@ -1171,6 +1189,21 @@ export function createCodexWire({
       writeFrame({ jsonrpc: '2.0', method: 'initialized' });
       await flushOutput();
       return result;
+    },
+
+    async readConfig(params = {}, options = {}) {
+      const cleanParams = { includeLayers: false, ...requireObject(params, 'config/read params') };
+      return requireObject(await request('config/read', cleanParams, options), 'config/read response');
+    },
+
+    async listModels(params = {}, options = {}) {
+      const cleanParams = requireObject(params, 'model/list params');
+      return requireObject(await request('model/list', cleanParams, options), 'model/list response');
+    },
+
+    async batchWriteConfig(params, options = {}) {
+      const cleanParams = requireObject(params, 'config/batchWrite params');
+      return requireObject(await request('config/batchWrite', cleanParams, options), 'config/batchWrite response');
     },
 
     async startThread(params, options = {}) {

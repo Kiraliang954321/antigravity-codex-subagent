@@ -19,6 +19,7 @@ import { normalizeCwdPath } from './codex-client.mjs';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DEFAULT_JOB_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_STALE_TEMP_FILE_MS = 5 * 60 * 1000;
+const JOB_SUMMARY_CACHE_TTL_MS = 1_000;
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -99,8 +100,10 @@ export function createDiskJobStore(jobsDir, {
 } = {}) {
   void jobTtlMs;
   const jobFilePath = (jobId) => path.join(jobsDir, `${jobId}.json`);
+  let summaryCache;
 
   const writeJob = (record) => {
+    summaryCache = undefined;
     if (!isValidJobId(record?.jobId)) return false;
     try {
       atomicWriteJsonFile(jobFilePath(record.jobId), record);
@@ -112,6 +115,7 @@ export function createDiskJobStore(jobsDir, {
   };
 
   const deleteJob = (jobId) => {
+    summaryCache = undefined;
     if (!isValidJobId(jobId)) return;
     try {
       unlinkSync(jobFilePath(jobId));
@@ -160,6 +164,7 @@ export function createDiskJobStore(jobsDir, {
   };
 
   const claimJobFromDisk = (jobId) => {
+    summaryCache = undefined;
     const parsed = peekJobFromDisk(jobId);
     if (!parsed) return null;
 
@@ -184,6 +189,7 @@ export function createDiskJobStore(jobsDir, {
   };
 
   const sweep = () => {
+    summaryCache = undefined;
     if (!existsSync(jobsDir)) return;
     let names;
     try {
@@ -231,7 +237,7 @@ export function createDiskJobStore(jobsDir, {
     }
   };
 
-  const listUnclaimed = (excludeJobIds = new Set(), { includeConversationId = false } = {}) => {
+  const scanUnclaimed = () => {
     if (!existsSync(jobsDir)) return [];
     let names;
     try {
@@ -244,7 +250,7 @@ export function createDiskJobStore(jobsDir, {
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const jobId = name.slice(0, -5);
-      if (!isValidJobId(jobId) || excludeJobIds.has(jobId)) continue;
+      if (!isValidJobId(jobId)) continue;
       const fullPath = path.join(jobsDir, name);
       let raw;
       try {
@@ -276,7 +282,7 @@ export function createDiskJobStore(jobsDir, {
       }
       out.push({
         jobId: parsed.jobId,
-        ...(includeConversationId && typeof parsed.conversationId === 'string' ? { conversationId: parsed.conversationId } : {}),
+        ...(typeof parsed.conversationId === 'string' ? { conversationId: parsed.conversationId } : {}),
         description: parsed.description ?? '',
         sessionKey: parsed.sessionKey ?? null,
         threadId: parsed.threadId ?? null,
@@ -292,6 +298,17 @@ export function createDiskJobStore(jobsDir, {
       });
     }
     return out;
+  };
+
+  const listUnclaimed = (excludeJobIds = new Set(), { includeConversationId = false, bypassCache = false } = {}) => {
+    if (bypassCache || !summaryCache || Date.now() >= summaryCache.refreshAt) {
+      summaryCache = { rows: scanUnclaimed(), refreshAt: Date.now() + JOB_SUMMARY_CACHE_TTL_MS };
+    }
+    const now = Date.now();
+    return summaryCache.rows
+      .filter((row) => !excludeJobIds.has(row.jobId) && now <= Date.parse(row.expiresAt))
+      .map(({ conversationId, ...row }) =>
+        includeConversationId && conversationId !== undefined ? { ...row, conversationId } : row);
   };
 
   return {

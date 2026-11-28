@@ -9,6 +9,15 @@ import { CodexRpcError, createCodexWire } from './codex-wire.mjs';
 export const DEFAULT_EOF_GRACE_MS = 6_000;
 export const DEFAULT_DISPOSE_GRACE_MS = 3_000;
 
+function readConfigMtimeMs(codexHome) {
+  try {
+    const configPath = path.join(codexHome || path.join(os.homedir(), '.codex'), 'config.toml');
+    return statSync(configPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 export const CODEX_SANDBOX_MODES = [
   'read-only',
   'workspace-write',
@@ -738,6 +747,8 @@ export async function startCodexRun(request, spec) {
   const codexHome = spec.codexHome ?? spec.env?.CODEX_HOME;
   const warmPool = spec.warmPool;
   const warmEnabled = Boolean(warmPool?.isEnabled?.()) && mode !== 'ephemeral';
+  // Use the same timestamp when parking so a config edit during the turn invalidates the worker.
+  const configMtimeMs = readConfigMtimeMs(codexHome);
   const buildWarmSignature = (modelValue) => JSON.stringify({
     cwdNorm: normalizeCwdPath(spec.cwd),
     permissionMode,
@@ -745,6 +756,7 @@ export async function startCodexRun(request, spec) {
     model: modelValue ?? null,
     config: spec.config ?? null,
     codexHome: codexHome ?? null,
+    configMtimeMs,
   });
   const requestedWarmSignature = buildWarmSignature(effectiveModel);
 
@@ -2141,6 +2153,147 @@ export async function probeCodexThread({
   }
 }
 
+async function withCodexConfigWire({
+  spawn, argv, wrapperPath, codexAnchorPath, cwd, env = {},
+  eofGraceMs = DEFAULT_EOF_GRACE_MS, disposeGraceMs = DEFAULT_DISPOSE_GRACE_MS,
+  signal, requestTimeoutMs,
+}, run) {
+  signal?.throwIfAborted();
+  const child = spawn({
+    argv: argv ?? resolveCodexAppServerArgv({ wrapperPath, codexAnchorPath }),
+    cwd,
+    stdio: { stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' },
+    graceMs: disposeGraceMs,
+    env,
+  });
+  const processExit = child.done.then(() => {
+    throw new Error('subagent-codex: app-server exited during config synchronization');
+  });
+  processExit.catch(() => {});
+  const onStderrError = () => {};
+  let wire;
+  try {
+    child.stderr?.on('error', onStderrError);
+    child.stderr?.resume();
+    if (!child.stdin || !child.stdout) {
+      throw new Error('subagent-codex: subprocess dropped piped stdio streams');
+    }
+    wire = createCodexWire({ stdin: child.stdin, stdout: child.stdout, requestTimeoutMs });
+    await Promise.race([wire.initialize({ signal }), processExit]);
+    return await run(wire);
+  } finally {
+    try {
+      await disposeCodexChild(wire, child, { eofGraceMs, disposeGraceMs });
+    } finally {
+      child.stderr?.off('error', onStderrError);
+    }
+  }
+}
+
+function configModelSettings(cfg) {
+  const model = cfg?.config?.model;
+  const effort = cfg?.config?.model_reasoning_effort;
+  return {
+    model: (typeof model === 'string' && model.trim()) || null,
+    reasoningEffort: (typeof effort === 'string' && effort.trim()) || null,
+  };
+}
+
+function normalizeCatalogModel(entry) {
+  return {
+    id: String(entry.id ?? entry.model),
+    model: String(entry.model ?? entry.id),
+    displayName: (typeof entry.displayName === 'string' && entry.displayName.trim()) || String(entry.model ?? entry.id),
+    description: typeof entry.description === 'string' ? entry.description.trim() : '',
+    isDefault: Boolean(entry.isDefault),
+    defaultReasoningEffort: (typeof entry.defaultReasoningEffort === 'string' && entry.defaultReasoningEffort.trim()) || null,
+    supportedReasoningEfforts: Array.isArray(entry.supportedReasoningEfforts)
+      ? entry.supportedReasoningEfforts.map((opt) => typeof opt === 'string'
+        ? { reasoningEffort: opt.trim(), description: '' }
+        : {
+            reasoningEffort: typeof opt?.reasoningEffort === 'string' ? opt.reasoningEffort.trim() : '',
+            description: typeof opt?.description === 'string' ? opt.description.trim() : '',
+          }).filter((opt) => opt.reasoningEffort.length > 0)
+      : [],
+  };
+}
+
+export async function readCodexConfigAndModels(options = {}) {
+  const { signal } = options;
+  try {
+    return await withCodexConfigWire(options, async (wire) => {
+      let cfg;
+      let configError = null;
+      try {
+        cfg = await wire.readConfig({ includeLayers: false }, { signal });
+      } catch (error) {
+        configError = sanitizeRpcErrorMessage(error);
+      }
+      let models = [];
+      let catalogError = null;
+      try {
+        let cursor;
+        for (let page = 0; page < 10 && models.length < 200; page += 1) {
+          const result = await wire.listModels({ includeHidden: false, ...(cursor ? { cursor } : {}) }, { signal });
+          if (!Array.isArray(result.data)) throw new Error('model/list response must contain a data array');
+          for (const entry of result.data) {
+            if (!entry || entry.hidden === true || (entry.id == null && entry.model == null)) continue;
+            models.push(normalizeCatalogModel(entry));
+            if (models.length === 200) break;
+          }
+          cursor = result.nextCursor;
+          if (!cursor) break;
+        }
+      } catch (error) {
+        models = [];
+        catalogError = sanitizeRpcErrorMessage(error);
+      }
+      const { model, reasoningEffort } = configModelSettings(cfg);
+      const catalogDefaultModel = models.find((entry) => entry.isDefault)?.model ?? models[0]?.model ?? null;
+      const matchedModel = models.find((entry) => entry.model.toLowerCase() === (model ?? catalogDefaultModel ?? '').toLowerCase());
+      return {
+        synced: configError === null,
+        model,
+        reasoningEffort,
+        catalogDefaultModel,
+        catalogDefaultReasoningEffort: matchedModel?.defaultReasoningEffort ?? null,
+        models,
+        catalogAvailable: catalogError === null,
+        ...(catalogError === null ? {} : { catalogError }),
+        error: configError ?? catalogError,
+      };
+    });
+  } catch (error) {
+    return {
+      synced: false,
+      model: null,
+      reasoningEffort: null,
+      catalogDefaultModel: null,
+      catalogDefaultReasoningEffort: null,
+      models: [],
+      catalogAvailable: false,
+      error: cleanDiagnosticText(toError(error).message),
+    };
+  }
+}
+
+export async function writeCodexUserConfig(options = {}) {
+  const { signal, model, reasoningEffort } = options;
+  const edits = [];
+  if (model !== undefined) edits.push({ keyPath: 'model', value: model, mergeStrategy: 'replace' });
+  if (reasoningEffort !== undefined) edits.push({ keyPath: 'model_reasoning_effort', value: reasoningEffort, mergeStrategy: 'replace' });
+  return withCodexConfigWire(options, async (wire) => {
+    const writeRes = await wire.batchWriteConfig({ edits }, { signal });
+    const cfg = await wire.readConfig({ includeLayers: false }, { signal });
+    return {
+      status: writeRes.status ?? 'ok',
+      overridden: Boolean(writeRes.overriddenMetadata || writeRes.status === 'okOverridden'),
+      overriddenMessage: typeof writeRes.overriddenMetadata?.message === 'string' ? writeRes.overriddenMetadata.message : null,
+      ...configModelSettings(cfg),
+    };
+  });
+}
+
 /**
  * Opt-in warm `app-server` worker pool keyed by persistent `threadId`.
  * Disabled by default (`idleMs = 0`). When enabled (`idleMs > 0`), reuses
@@ -2285,8 +2438,7 @@ export function createWarmCodexPool({
     return entry.worker;
   };
 
-  const disposeAll = async () => {
-    disposed = true;
+  const evictParked = () => {
     const tasks = [];
     for (const threadId of [...pool.keys()]) {
       const entry = clearEntry(threadId);
@@ -2294,9 +2446,17 @@ export function createWarmCodexPool({
         tasks.push(trackEviction(threadId, entry.worker));
       }
     }
-    for (const pending of inFlightEvictions.values()) {
-      tasks.push(pending);
-    }
+    return tasks;
+  };
+
+  const evictAll = async () => {
+    await Promise.allSettled(evictParked());
+  };
+
+  const disposeAll = async () => {
+    disposed = true;
+    evictParked();
+    const tasks = [...inFlightEvictions.values()];
     const results = await Promise.allSettled(tasks);
     for (const threadId of [...failedEvictions.keys()]) {
       try {
@@ -2316,6 +2476,7 @@ export function createWarmCodexPool({
     discardWorker,
     parkWorker,
     evict,
+    evictAll,
     disposeAll,
     stats: () => ({
       enabled: !disposed && normalizedIdleMs > 0,

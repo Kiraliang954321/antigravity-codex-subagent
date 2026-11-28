@@ -6,6 +6,21 @@ import { atomicWriteJsonFile } from './disk-job-store.mjs';
 
 const IMMEDIATE_EVENTS = new Set(['delegation', 'steer', 'answer', 'compact', 'fork', 'cancel', 'closed']);
 const TEXT_META = new Set(['title', 'lastPreview', 'latestPlan', 'latestDiffSummary', 'model']);
+const COMMAND_OUTPUT_MAX_BYTES = 8192;
+
+function stripAnswerFooter(text) {
+  return typeof text === 'string'
+    ? text.replace(/\r?\n\r?\n\[codex-thread [^\r\n\]]+\](?:\r?\n\[CONTEXT_WARNING\][^\r\n]*)*\s*$/, '')
+    : '';
+}
+
+function utf8Tail(text, maxBytes) {
+  const bytes = Buffer.from(text, 'utf8');
+  if (bytes.length <= maxBytes) return text;
+  let start = bytes.length - maxBytes;
+  while ((bytes[start] & 0xc0) === 0x80) start += 1;
+  return bytes.toString('utf8', start);
+}
 
 function sha256(text) {
   return createHash('sha256').update(text).digest('hex');
@@ -165,7 +180,7 @@ export function createTranscriptStore(transcriptsDir, {
     }
   };
 
-  const appendEvent = (id, { type, jobId, turnId, ...payload }) => {
+  const appendEvent = (id, { type, jobId, turnId, ...payload }, { immediate = IMMEDIATE_EVENTS.has(type) } = {}) => {
     const conv = conversations.get(id);
     if (!conv) return;
     const at = new Date().toISOString();
@@ -175,28 +190,104 @@ export function createTranscriptStore(transcriptsDir, {
     conv.events.push(event);
     trimEvents(conv);
     conv.updatedAt = at;
-    markDirty(id, IMMEDIATE_EVENTS.has(type));
+    markDirty(id, immediate);
+    return structuredClone(event);
   };
 
   const upsertStreamEvent = (id, { jobId, turnId, channel, itemId = null, delta }) => {
     const conv = conversations.get(id);
     if (!conv || typeof delta !== 'string' || !delta) return;
     const index = conv.events.findIndex((event) => event.type === 'stream' && event.jobId === jobId
-      && event.turnId === turnId && event.channel === channel && (event.itemId ?? 'default') === (itemId ?? 'default'));
-    const event = index < 0
-      ? { eventId: randomUUID(), type: 'stream', jobId, turnId, channel, itemId, text: '' }
-      : conv.events.splice(index, 1)[0];
+      && event.turnId === turnId && event.channel === channel && (event.itemId ?? null) === itemId);
+    const previous = conv.events[index];
+    if (previous?.done === true || previous?.superseded === true) return;
+    const at = new Date().toISOString();
+    const event = previous
+      ? conv.events.splice(index, 1)[0]
+      : { eventId: randomUUID(), type: 'stream', jobId, turnId, channel, itemId, text: '', done: false, startedAt: at };
     const raw = (rawStreams.get(event) ?? event.text) + delta;
     const text = redactSecrets(raw);
-    event.text = text.length > maxTextChars ? text.slice(text.length - maxTextChars) : text;
-    rawStreams.set(event, raw.length > maxTextChars ? event.text : raw);
-    if (text.length > maxTextChars) event.truncated = true;
+    const textTail = text.slice(Math.max(0, text.length - maxTextChars));
+    event.text = channel === 'commandOutput' ? utf8Tail(text, COMMAND_OUTPUT_MAX_BYTES) : textTail;
+    rawStreams.set(event, raw.length > maxTextChars ? textTail : raw);
+    if (event.text.length < text.length) event.truncated = true;
     event.seq = ++conv.nextSeq;
-    event.at = new Date().toISOString();
+    event.at = at;
     conv.events.push(event);
     trimEvents(conv);
     conv.updatedAt = event.at;
     markDirty(id);
+  };
+
+  const updateStreams = (id, matches, patchFor, { immediate = false, preserveUpdatedAt = false } = {}) => {
+    const conv = conversations.get(id);
+    if (!conv) return 0;
+    const updated = [];
+    const at = new Date().toISOString();
+    conv.events = conv.events.filter((event) => {
+      if (event.type !== 'stream' || !matches(event)) return true;
+      const patch = patchFor(event);
+      if (event.done === true && (patch.superseded !== true || event.superseded === true)) return true;
+      event.startedAt ??= event.at;
+      event.done = true;
+      rawStreams.delete(event);
+      if (patch.superseded === true) {
+        event.superseded = true;
+        event.text = '';
+        if (patch.supersededBy) event.supersededBy = patch.supersededBy;
+      }
+      event.seq = ++conv.nextSeq;
+      event.at = at;
+      updated.push(event);
+      return false;
+    });
+    if (updated.length > 0) {
+      conv.events.push(...updated);
+      if (!preserveUpdatedAt) conv.updatedAt = at;
+      markDirty(id, immediate);
+    } else if (immediate) {
+      flushConversation(id);
+    }
+    return updated.length;
+  };
+
+  const finalizeStreams = (id, selector = {}, patch = {}) => {
+    const keys = ['jobId', 'turnId', 'channel', 'itemId'].filter((key) => selector[key] !== undefined);
+    return updateStreams(id, (event) => keys.every((key) => event[key] === selector[key]), () => patch,
+      { immediate: patch.immediate === true });
+  };
+
+  const supersedeAnswerStreams = (id, { jobId, turnId, itemId, answer, text }) => {
+    const matchesTurn = (event) => event.type === 'stream' && event.channel === 'agentMessage'
+      && event.jobId === jobId && (event.turnId ?? null) === (turnId ?? null) && event.superseded !== true;
+    const selected = itemId && conversations.get(id)?.events.find((event) => matchesTurn(event) && event.itemId === itemId);
+    const body = redactSecrets(stripAnswerFooter(text));
+    return updateStreams(id, (event) => matchesTurn(event)
+      && (selected ? event === selected : Boolean(body) && event.text === body),
+    () => ({ superseded: true, supersededBy: answer.eventId }));
+  };
+
+  const reconcileStreams = (conv) => {
+    const commentary = new Map();
+    const answers = new Map();
+    const turnKey = (event) => JSON.stringify([event.jobId, event.turnId ?? null]);
+    const itemKey = (event) => JSON.stringify([event.jobId, event.turnId ?? null, event.itemId]);
+    const answerKey = (event, body) => JSON.stringify([turnKey(event), body]);
+    for (const event of conv.events) {
+      if (!event.jobId) continue;
+      if (event.type === 'activity' && event.kind === 'commentary' && event.phase === 'completed'
+        && event.itemId && typeof event.summary?.text === 'string' && event.summary.text.trim()) {
+        commentary.set(itemKey(event), event.eventId);
+      } else if (event.type === 'answer') {
+        const body = stripAnswerFooter(event.text);
+        if (body) answers.set(answerKey(event, body), event.eventId);
+      }
+    }
+    updateStreams(conv.conversationId, () => true, (event) => {
+      if (event.channel !== 'agentMessage' || !event.jobId || event.superseded === true) return {};
+      const replacement = (event.itemId ? commentary.get(itemKey(event)) : undefined) ?? answers.get(answerKey(event, event.text));
+      return replacement ? { superseded: true, supersededBy: replacement } : {};
+    }, { immediate: true, preserveUpdatedAt: true });
   };
 
   let entries = [];
@@ -215,11 +306,14 @@ export function createTranscriptStore(transcriptsDir, {
     } catch {}
   }
   evictIfNeeded();
+  for (const conv of conversations.values()) reconcileStreams(conv);
 
   return {
     ensureConversation,
     appendEvent,
     upsertStreamEvent,
+    finalizeStreams,
+    supersedeAnswerStreams,
     updateMeta,
     listConversations: () => [...conversations.values()].map(metadata),
     getConversation(id, { afterSeq = 0, limit = 200 } = {}) {

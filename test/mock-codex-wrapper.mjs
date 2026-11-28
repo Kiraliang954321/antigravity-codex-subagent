@@ -20,6 +20,61 @@ const SANDBOX_MAP = {
   'danger-full-access': { type: 'dangerFullAccess' },
 };
 
+const configPath = path.join(stateDir, 'mock-codex-config.json');
+const configWritesPath = path.join(stateDir, 'mock-config-writes.txt');
+const effortOption = (reasoningEffort, description) => ({ reasoningEffort, description });
+const defaultModels = [
+  {
+    id: 'mock-codex-pro', model: 'mock-codex-pro', displayName: 'Mock Codex Pro',
+    description: 'Balanced flagship coding model.', hidden: false, isDefault: true, defaultReasoningEffort: 'low',
+    supportedReasoningEfforts: [
+      effortOption('low', 'Fast responses'), effortOption('medium', 'Balanced reasoning'),
+      effortOption('high', 'Deep reasoning'), effortOption('xhigh', 'Extra high reasoning'),
+      effortOption('max', 'Maximum reasoning'), effortOption('ultra', 'Maximum with delegation'),
+    ],
+  },
+  {
+    id: 'mock-codex-fast', model: 'mock-codex-fast', displayName: 'Mock Codex Fast',
+    description: 'Quick turnaround for everyday edits.', hidden: false, isDefault: false, defaultReasoningEffort: 'medium',
+    supportedReasoningEfforts: [
+      effortOption('low', 'Fast'), effortOption('medium', 'Balanced'), effortOption('high', 'Thorough'),
+      effortOption('xhigh', 'Extra high'), effortOption('max', 'Max'),
+    ],
+  },
+  {
+    id: 'mock-codex-mini', model: 'mock-codex-mini', displayName: 'Mock Codex Mini',
+    description: 'Lightweight model for quick checks.', hidden: false, isDefault: false, defaultReasoningEffort: 'low',
+    supportedReasoningEfforts: [
+      effortOption('low', 'Fast'), effortOption('medium', 'Balanced'), effortOption('high', 'Thorough'),
+    ],
+  },
+];
+
+function saveMockConfig(cfg) {
+  const temporaryPath = `${configPath}.${process.pid}.tmp`;
+  writeFileSync(temporaryPath, JSON.stringify(cfg), 'utf8');
+  renameSync(temporaryPath, configPath);
+}
+
+function loadMockConfig() {
+  try {
+    return JSON.parse(readFileSync(configPath, 'utf8'));
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  const seed = {
+    model: process.env.MOCK_CODEX_CONFIG_MODEL || null,
+    model_reasoning_effort: process.env.MOCK_CODEX_CONFIG_EFFORT || null,
+  };
+  try {
+    writeFileSync(configPath, JSON.stringify(seed), { encoding: 'utf8', flag: 'wx' });
+    return seed;
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    return JSON.parse(readFileSync(configPath, 'utf8'));
+  }
+}
+
 function metaPath(threadId) {
   return path.join(stateDir, `meta-${threadId}.json`);
 }
@@ -77,7 +132,53 @@ async function handleRequest(msg) {
   }
   if (method === 'initialized') return;
 
+  if (method === 'config/read') {
+    const cfg = loadMockConfig();
+    sendResult(id, {
+      config: { model: cfg.model ?? null, model_reasoning_effort: cfg.model_reasoning_effort ?? null },
+      origins: {},
+    });
+    return;
+  }
+
+  if (method === 'config/batchWrite') {
+    if (process.env.MOCK_CODEX_CONFIG_WRITE_FAIL === '1') {
+      sendError(id, -32603, 'mock config write error');
+      return;
+    }
+    const cfg = loadMockConfig();
+    for (const { keyPath, value } of params.edits ?? []) {
+      if (keyPath === 'model' || keyPath === 'model_reasoning_effort') {
+        cfg[keyPath] = typeof value === 'string' ? (value.trim() || null) : null;
+      }
+    }
+    saveMockConfig(cfg);
+    const writes = existsSync(configWritesPath) ? Number(readFileSync(configWritesPath, 'utf8')) : 0;
+    writeFileSync(configWritesPath, String(writes + 1), 'utf8');
+    const overridden = process.env.MOCK_CODEX_CONFIG_OVERRIDDEN === '1';
+    sendResult(id, {
+      status: overridden ? 'okOverridden' : 'ok',
+      filePath: configPath,
+      version: 'sha256:mock',
+      overriddenMetadata: overridden ? {
+        effectiveValue: cfg.model, message: 'Overridden by test layer',
+        overridingLayer: { name: { type: 'sessionFlags' }, version: '1' },
+      } : null,
+    });
+    return;
+  }
+
+  if (method === 'model/list') {
+    const entries = process.env.MOCK_CODEX_MODELS_JSON ? JSON.parse(process.env.MOCK_CODEX_MODELS_JSON) : defaultModels;
+    const models = params.includeHidden === true ? entries : entries.filter((entry) => entry.hidden !== true);
+    const offset = Number(params.cursor ?? 0);
+    const end = offset + (params.limit ?? 2);
+    sendResult(id, { data: models.slice(offset, end), nextCursor: end < models.length ? String(end) : null });
+    return;
+  }
+
   if (method === 'thread/start') {
+    const cfg = loadMockConfig();
     const threadId = randomUUID();
     const ephemeral = Boolean(params.ephemeral);
     const rolloutPath = ephemeral ? null : path.join(sessionsDir, `rollout-${threadId}.jsonl`);
@@ -100,7 +201,8 @@ async function handleRequest(msg) {
       approvalPolicy = undefined;
     }
 
-    let model = params.model ?? 'mock-codex-model';
+    let model = params.model ?? cfg.model ?? 'mock-codex-model';
+    const reasoningEffort = params.config?.model_reasoning_effort ?? cfg.model_reasoning_effort ?? null;
     if (process.env.MOCK_CODEX_WRONG_MODEL) {
       model = process.env.MOCK_CODEX_WRONG_MODEL;
     }
@@ -109,6 +211,7 @@ async function handleRequest(msg) {
       id: threadId,
       cwd: params.cwd,
       model,
+      reasoningEffort,
       ephemeral,
       path: rolloutPath,
       archived: false,
@@ -175,6 +278,8 @@ async function handleRequest(msg) {
       sendError(id, -32600, `thread ${params.threadId} is archived`);
       return;
     }
+    const cfg = loadMockConfig();
+    meta.reasoningEffort = params.config?.model_reasoning_effort ?? cfg.model_reasoning_effort ?? meta.reasoningEffort ?? null;
     if (params.model !== undefined && params.model !== null) {
       meta.model = params.model;
     }
@@ -239,7 +344,9 @@ async function handleRequest(msg) {
       `${JSON.stringify({ type: 'session_meta', payload: { id: newThreadId, forkedFrom: source.id, lastTurnId: params.lastTurnId ?? null } })}\n`,
       'utf8',
     );
-    const model = params.model ?? source.model ?? 'mock-codex-model';
+    const cfg = loadMockConfig();
+    const model = params.model ?? source.model ?? cfg.model ?? 'mock-codex-model';
+    const reasoningEffort = params.config?.model_reasoning_effort ?? source.reasoningEffort ?? cfg.model_reasoning_effort ?? null;
     const approvalPolicy = params.approvalPolicy ?? source.approvalPolicy ?? 'never';
     const sandboxPolicy = params.sandbox
       ? (SANDBOX_MAP[params.sandbox] ?? SANDBOX_MAP['workspace-write'])
@@ -248,6 +355,7 @@ async function handleRequest(msg) {
       id: newThreadId,
       cwd: params.cwd ?? source.cwd,
       model,
+      reasoningEffort,
       ephemeral: Boolean(params.ephemeral),
       path: newRolloutPath,
       archived: false,
@@ -393,6 +501,7 @@ async function handleRequest(msg) {
       sendError(id, -32600, `no rollout found for thread id ${params.threadId}`);
       return;
     }
+    const cfg = loadMockConfig();
     const turnId = `turn_${++turnCounter}_${randomUUID().slice(0, 6)}`;
     const directive = parseDirective(params.input);
 
@@ -434,11 +543,16 @@ async function handleRequest(msg) {
       sendNotification('item/started', {
         ...scope, item: { type: 'commandExecution', id: 'ui-command', command: ['echo', 'Bearer', 'abcdefgh12345678'], status: 'inProgress' },
       });
-      sendNotification('item/commandExecution/outputDelta', { ...scope, itemId: 'ui-command', delta: 'SECRET_CMD_DELTA_LINE' });
+      for (const delta of ['😀'.repeat(3000), 'SECRET_CMD_DELTA_LINE Bearer abcdef', 'gh12345678 sk-', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ end']) {
+        sendNotification('item/commandExecution/outputDelta', { ...scope, itemId: 'ui-command', delta });
+      }
       sendNotification('item/completed', {
         ...scope, item: { type: 'commandExecution', id: 'ui-command', status: 'completed', exitCode: 0, aggregatedOutput: 'NOT_ACTIVITY_SUMMARY' },
       });
+      sendNotification('item/commandExecution/outputDelta', { ...scope, itemId: 'ui-command', delta: 'LATE_COMMAND_DELTA' });
+      sendNotification('item/started', { ...scope, item: { id: 'ui-reasoning', type: 'reasoning' } });
       sendNotification('item/agentMessage/delta', { ...scope, itemId: 'ui-message', delta: 'Monitor-only agent delta' });
+      sendNotification('item/agentMessage/delta', { ...scope, itemId: `msg-${turnId}`, delta: 'Monitor answer' });
       sendNotification('turn/plan/updated', {
         ...scope, explanation: 'Inspect tokens and credentials', plan: [{ step: 'Review file', status: 'inProgress' }],
       });
@@ -450,9 +564,16 @@ async function handleRequest(msg) {
       sendNotification('item/reasoning/textDelta', {
         ...scope, itemId: 'ui-reasoning', delta: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ Bearer abcdefgh12345678 complete',
       });
+      sendNotification('item/completed', { ...scope, item: { id: 'ui-reasoning', type: 'reasoning' } });
+      sendNotification('item/completed', {
+        ...scope, item: { id: 'ui-message', type: 'agentMessage', phase: 'commentary', text: 'Monitor-only agent delta' },
+      });
       for (let index = 0; index < (directive.bulkDiffs ?? 0); index += 1) {
         sendNotification('turn/diff/updated', { ...scope, diff: `${diff}${'多'.repeat(32000)}` });
       }
+      sendNotification('item/completed', {
+        ...scope, item: { id: 'ui-file-change', type: 'fileChange', status: 'completed', changes: [{ path: 'activity.txt' }] },
+      });
     } else if (directive.mode === 'stream_plan_diff') {
       await sleep(300);
       sendNotification('item/reasoning/summaryTextDelta', {
@@ -590,7 +711,7 @@ async function handleRequest(msg) {
       turnApprovalPolicy: params.approvalPolicy ?? null,
       turnSandboxPolicy: params.sandboxPolicy ?? null,
       turnModel: params.model ?? null,
-      effort: params.effort ?? null,
+      effort: params.effort ?? meta.reasoningEffort ?? cfg.model_reasoning_effort ?? null,
       outputSchema: params.outputSchema ?? null,
       forkedFrom: meta.forkedFrom ?? null,
       lastTurnId: meta.lastTurnId ?? null,
@@ -618,7 +739,7 @@ async function handleRequest(msg) {
         id: `msg-${turnId}`,
         type: 'agentMessage',
         phase: 'final_answer',
-        text: JSON.stringify(answerPayload),
+        text: directive.mode === 'ui_stream' ? directive.answer : JSON.stringify(answerPayload),
       },
     });
     sendNotification('turn/completed', {

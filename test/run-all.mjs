@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -35,8 +35,8 @@ function isolatedJobsDirFor(storePath) {
   return path.join(path.dirname(storePath), 'jobs', `${baseName}-${hash}`);
 }
 
-function startMcpServer(extraEnv = {}) {
-  const child = spawn(process.execPath, [SERVER_PATH], {
+function startMcpServer(extraEnv = {}, serverPath = SERVER_PATH) {
+  const child = spawn(process.execPath, [serverPath], {
     cwd: TEST_WORK_DIR,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...extraEnv },
@@ -211,6 +211,10 @@ await test('1. codex-wire stale prior-turn isolation, 300+ early telemetry burst
   assert.equal(r3.output[0].text, 'ans3-survived-burst');
   assert.equal(r3.diagnostic, undefined, 'diagnostic must reset on reused wire');
   assert.equal(r3.usage.totalTokens, 333);
+  assert.deepEqual(diagnostics.filter((event) => event.type === 'itemCompleted' || event.type === 'answerItemSelected'), [
+    { type: 'itemCompleted', threadId: 'th-1', turnId: 't3', itemId: 'a3', itemType: 'agentMessage', phase: 'final_answer' },
+    { type: 'answerItemSelected', threadId: 'th-1', turnId: 't3', itemId: 'a3', phase: 'final_answer' },
+  ]);
   const t3Req = sent.filter((m) => m.method === 'turn/start')[2];
   assert.deepEqual(t3Req.params.input[1], { type: 'localImage', path: 'C:\\tmp\\img.png' });
 
@@ -1486,7 +1490,10 @@ function monitorEnv(dir, extra = {}) {
 
 function monitorPayload(result) {
   assert.ok(!result.isError, toolText(result));
-  assert.deepEqual(JSON.parse(toolText(result)), result.structuredContent);
+  const text = toolText(result);
+  assert.ok(text.length > 0 && text.length <= 128);
+  assert.doesNotMatch(text, /^\s*[\[{]/);
+  assert.ok(result.structuredContent && typeof result.structuredContent === 'object');
   return result.structuredContent;
 }
 
@@ -1509,6 +1516,7 @@ await test('18. MCP Apps resource discovery, fresh override, and app-only tool m
     assert.deepEqual(contents[0]._meta, resources[0]._meta);
     assert.match(contents[0].text, /<!doctype html>/i);
     assert.match(contents[0].text, /Codex Monitor/);
+    assert.deepEqual((await srv.request('resources/read', { uri })).contents, contents);
     await assert.rejects(srv.request('resources/read', { uri: `${uri}/unknown` }), /RPC error -32602/);
     const { tools } = await srv.request('tools/list');
     const open = tools.find((tool) => tool.name === 'subagent_codex_monitor');
@@ -1518,23 +1526,58 @@ await test('18. MCP Apps resource discovery, fresh override, and app-only tool m
     ]);
     const appTools = tools.filter((tool) => tool.name.startsWith('codex_ui_'));
     assert.deepEqual(appTools.map((tool) => tool.name).sort(), [
-      'codex_ui_action', 'codex_ui_get_conversation', 'codex_ui_list_conversations', 'codex_ui_steer',
+      'codex_ui_action', 'codex_ui_get_conversation', 'codex_ui_get_settings', 'codex_ui_list_conversations', 'codex_ui_steer', 'codex_ui_update_settings',
     ]);
     for (const tool of appTools) assert.deepEqual(tool._meta.ui.visibility, ['app']);
     const opened = await srv.callTool(open.name, {});
-    assert.match(toolText(opened), /Codex Subagent Monitor/);
-    assert.deepEqual(opened.structuredContent, { serverVersion: '0.5.0', initialConversationId: null, counts: { running: 0, sessions: 0, total: 0 } });
+    assert.equal(toolText(opened), 'Codex Subagent Monitor');
+    const { cursorEpoch, ...payload } = monitorPayload(opened);
+    assert.match(cursorEpoch, /^[a-f0-9-]{36}$/);
+    assert.deepEqual(payload, {
+      serverVersion: '0.5.0', initialConversationId: null, counts: { running: 0, sessions: 0, total: 0 },
+      initialSnapshot: { conversations: [], hasMoreConversations: false, initialConversation: null },
+    });
+    const listed = monitorPayload(await srv.callTool('codex_ui_list_conversations', { include: 'initialConversation' }));
+    assert.equal(listed.cursorEpoch, cursorEpoch);
+    assert.deepEqual(listed.conversations, []);
+    assert.equal(listed.hasMoreConversations, false);
+    assert.equal(listed.initialConversation, null);
   } finally {
     await srv.stop();
+  }
+  const cacheDir = path.join(dir, 'cache');
+  const defaultHtml = path.join(cacheDir, 'ui', 'dist', 'monitor.html');
+  mkdirSync(path.dirname(defaultHtml), { recursive: true });
+  cpSync(path.join(PLUGIN_ROOT, 'mcp'), path.join(cacheDir, 'mcp'), { recursive: true });
+  const first = '<!doctype html><p>first</p>';
+  const second = '<!doctype html><p>other</p>';
+  const timestamp = new Date('2025-01-01T00:00:00Z');
+  writeFileSync(defaultHtml, first);
+  utimesSync(defaultHtml, timestamp, timestamp);
+  const cached = startMcpServer(monitorEnv(cacheDir), path.join(cacheDir, 'mcp', 'server.mjs'));
+  try {
+    const read = async () => (await cached.request('resources/read', { uri })).contents[0].text;
+    assert.equal(await read(), first);
+    writeFileSync(defaultHtml, second);
+    utimesSync(defaultHtml, timestamp, timestamp);
+    assert.equal(await read(), first, 'same path, mtime and size use the cached default HTML');
+    const changed = new Date('2025-01-01T00:00:01Z');
+    utimesSync(defaultHtml, changed, changed);
+    assert.equal(await read(), second);
+  } finally {
+    await cached.stop();
   }
   const custom = startMcpServer(monitorEnv(dir, { CODEX_MONITOR_HTML: override }));
   try {
     await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
-    for (const html of ['<!doctype html><p>first</p>', '<!doctype html><p>second</p>']) {
+    for (const html of ['<!doctype html><p>first</p>', '<!doctype html><p>other</p>']) {
       writeFileSync(override, html);
+      utimesSync(override, timestamp, timestamp);
       assert.equal((await custom.request('resources/read', { uri })).contents[0].text, html);
     }
     writeFileSync(override, '');
+    await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
+    rmSync(override);
     await assert.rejects(custom.request('resources/read', { uri }), /RPC error -32603/);
     const fd = openSync(override, 'w');
     try { ftruncateSync(fd, 10 * 1024 * 1024 + 1); } finally { closeSync(fd); }
@@ -1550,6 +1593,12 @@ await test('19. UI transcript coalescing, incremental polling, redaction, safe l
   mkdirSync(cwd, { recursive: true });
   const inside = path.join(cwd, 'inside.txt');
   writeFileSync(inside, 'inside');
+  const absoluteInside = path.join(cwd, 'absolute.txt');
+  writeFileSync(absoluteInside, 'absolute');
+  const relativeAnswer = path.join(cwd, 'answer-relative.txt');
+  const activityFile = path.join(cwd, 'activity.txt');
+  writeFileSync(relativeAnswer, 'relative');
+  writeFileSync(activityFile, 'activity');
   writeFileSync(path.join(dir, 'outside.txt'), 'outside');
   symlinkSync(dir, path.join(cwd, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
   const env = monitorEnv(dir);
@@ -1558,60 +1607,131 @@ await test('19. UI transcript coalescing, incremental polling, redaction, safe l
   writeFileSync(path.join(transcriptDir, 'conv-00000000000000000000.json'), 'invalid JSON');
   const sessionKey = 'monitor:session';
   const conversationId = `session:${sessionKey}`;
+  const transcriptFile = path.join(transcriptDir, `conv-${createHash('sha256').update(conversationId).digest('hex').slice(0, 20)}.json`);
+  const absoluteTarget = (process.platform === 'win32' ? '/' : '') + absoluteInside.replaceAll('\\', '/');
+  const answer = `Monitor answer [inside](inside.txt:1) [relative](answer-relative.txt:1) [absolute](<${absoluteTarget}:2:3>) [outside](../outside.txt) [escape](escape/outside.txt)`;
   const srv = startMcpServer(env);
-  let streamEvent;
+  let priorEpoch;
   let jobId;
   try {
     const running = await srv.callTool('subagent_codex', {
-      cwd, sessionKey, description: 'Monitor stream', prompt: JSON.stringify({ mode: 'ui_stream', bulkDiffs: 9 }), waitMs: 1000,
+      cwd, sessionKey, description: 'Monitor stream', prompt: JSON.stringify({ mode: 'ui_stream', bulkDiffs: 8, answer }), waitMs: 1000,
     }, { progressToken: 'monitor-private' });
     const live = JSON.parse(toolText(running));
     assert.equal(live.status, 'running');
     jobId = live.jobId;
-    assert.equal((await srv.callTool('subagent_codex_monitor', { jobId })).structuredContent.initialConversationId, conversationId);
+    const opened = await srv.callTool('subagent_codex_monitor', { jobId });
+    assert.ok(Buffer.byteLength(JSON.stringify(opened)) <= 192 * 1024);
+    const openPayload = monitorPayload(opened);
+    assert.equal(openPayload.initialConversationId, conversationId);
+    assert.equal(openPayload.initialSnapshot.initialConversation.conversation.conversationId, conversationId);
+    assert.equal(openPayload.initialSnapshot.initialConversation.fileLinks, undefined);
     const before = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId }));
+    priorEpoch = before.cursorEpoch;
+    assert.equal(before.reset, false);
     assert.equal(before.liveJob.jobId, jobId);
     assert.equal(before.liveJob.steerable, true);
     assert.equal(before.conversation.turnCount, 1);
     assert.equal(before.conversation.latestPlan.explanation, 'Inspect tokens and credentials');
     assert.deepEqual(before.fileLinks, [{ path: 'inside.txt', uri: pathToFileURL(inside).href }]);
     assert.ok(before.events.some((event) => event.type === 'diff' && event.diff.includes('SECRET_DIFF_BODY')));
-    assert.ok(before.events.some((event) => event.type === 'stream' && event.channel === 'commandOutput' && event.text === 'SECRET_CMD_DELTA_LINE'));
-    assert.ok(before.events.some((event) => event.type === 'stream' && event.channel === 'agentMessage'));
+    const command = before.events.find((event) => event.type === 'stream' && event.channel === 'commandOutput');
+    assert.equal(command.done, true);
+    assert.equal(command.truncated, true);
+    assert.ok(Buffer.byteLength(command.text) <= 8192 && Buffer.byteLength(command.text) > 8188);
+    assert.match(command.text, /^😀+SECRET_CMD_DELTA_LINE Bearer \[REDACTED\] sk-\[REDACTED\] end$/u);
+    const commentary = before.events.find((event) => event.itemId === 'ui-message');
+    const finalStream = before.events.find((event) => event.itemId === `msg-${before.liveJob.telemetry.turnId}`);
+    assert.equal(commentary.done, false);
+    assert.equal(finalStream.done, false);
     assert.ok(before.events.some((event) => event.type === 'activity' && event.summary.command === 'echo Bearer [REDACTED]'));
     assert.ok(before.events.some((event) => event.type === 'activity' && event.summary.exitCode === 0));
-    streamEvent = before.events.find((event) => event.type === 'stream' && event.channel === 'reasoning');
+    const streamEvent = before.events.find((event) => event.type === 'stream' && event.channel === 'reasoning');
     assert.equal(streamEvent.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-');
-    assert.doesNotMatch(JSON.stringify([running, srv.getNotifications()]), /SECRET_THOUGHT_DELTA|SECRET_CMD_DELTA_LINE|SECRET_DIFF_BODY|abcdefgh12345678/);
+    assert.doesNotMatch(JSON.stringify([running, srv.getNotifications()]), /SECRET_THOUGHT_DELTA|SECRET_CMD_DELTA_LINE|SECRET_DIFF_BODY|abcdefgh12345678|itemCompleted|answerItemSelected/);
 
     writeFileSync(path.join(env.MOCK_CODEX_STATE_DIR, 'continue-ui-stream'), 'go');
     await pollMonitor(async () => {
       const listed = monitorPayload(await srv.callTool('codex_ui_list_conversations'));
       return listed.conversations[0]?.status === 'completed_unclaimed';
     });
-    const incremental = await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: before.nextSeq });
+    const bootResult = await srv.callTool('codex_ui_list_conversations', { include: 'initialConversation', conversationId });
+    assert.ok(Buffer.byteLength(JSON.stringify(bootResult)) <= 192 * 1024);
+    const boot = monitorPayload(bootResult);
+    assert.ok(Buffer.byteLength(JSON.stringify(boot.conversations)) <= 32 * 1024);
+    assert.equal(boot.initialConversation.hasMore, true);
+    assert.equal(boot.initialConversation.nextSeq, boot.initialConversation.events.at(-1).seq);
+    const bootNext = monitorPayload(await srv.callTool('codex_ui_get_conversation', {
+      conversationId, afterSeq: boot.initialConversation.nextSeq, cursorEpoch: boot.cursorEpoch, limit: 1,
+    }));
+    assert.ok(bootNext.events[0].seq > boot.initialConversation.nextSeq);
+    const incremental = await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: before.nextSeq, cursorEpoch: priorEpoch });
     assert.ok(Buffer.byteLength(JSON.stringify(incremental), 'utf8') <= 512 * 1024);
     const batch = monitorPayload(incremental);
     assert.equal(batch.truncated, true);
     assert.equal(batch.hasMore, true);
-    const updated = batch.events.find((event) => event.eventId === streamEvent.eventId);
-    assert.ok(updated.seq > before.nextSeq);
-    assert.equal(updated.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-[REDACTED] Bearer [REDACTED] complete');
     assert.equal(batch.nextSeq, batch.events.at(-1).seq);
-    const later = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: batch.nextSeq, limit: 1 }));
+    const later = monitorPayload(await srv.callTool('codex_ui_get_conversation', { conversationId, afterSeq: batch.nextSeq }));
     assert.ok(later.events[0].seq > batch.nextSeq);
-    const transcriptFile = `conv-${createHash('sha256').update(conversationId).digest('hex').slice(0, 20)}.json`;
-    assert.ok(readdirSync(transcriptDir).includes(transcriptFile));
-    assert.doesNotMatch(readFileSync(path.join(transcriptDir, transcriptFile), 'utf8'), /sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ|abcdefgh12345678|NOT_ACTIVITY_SUMMARY/);
+    assert.equal(later.hasMore, false);
+    const events = [...batch.events, ...later.events];
+    assert.ok(![...before.events, ...events].some((event) => event.type === 'activity' && event.kind === 'reasoning'));
+    const updated = events.find((event) => event.eventId === streamEvent.eventId);
+    assert.ok(updated.seq > before.nextSeq);
+    assert.equal(updated.done, true);
+    assert.equal(updated.text, 'SECRET_THOUGHT_DELTA tokens=80000/100000; sk-[REDACTED] Bearer [REDACTED] complete');
+    for (const [original, replacement] of [
+      [commentary, events.find((event) => event.type === 'activity' && event.kind === 'commentary')],
+      [finalStream, events.find((event) => event.type === 'answer')],
+    ]) {
+      const finished = events.find((event) => event.eventId === original.eventId);
+      assert.ok(finished.seq > before.nextSeq);
+      assert.equal(finished.startedAt, original.startedAt);
+      assert.equal(finished.done, true);
+      assert.equal(finished.superseded, true);
+      assert.equal(finished.supersededBy, replacement.eventId);
+      assert.equal(finished.text, '');
+    }
+    assert.deepEqual(Object.fromEntries(later.fileLinks.map(({ path, uri }) => [path, uri])), {
+      'inside.txt': pathToFileURL(inside).href,
+      'activity.txt': pathToFileURL(activityFile).href,
+      'answer-relative.txt': pathToFileURL(relativeAnswer).href,
+      [absoluteInside.replaceAll('\\', '/')]: pathToFileURL(absoluteInside).href,
+    });
+    assert.doesNotMatch(readFileSync(transcriptFile, 'utf8'), /sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ|abcdefgh12345678|NOT_ACTIVITY_SUMMARY/);
   } finally {
     await srv.stop();
   }
+  const legacy = JSON.parse(readFileSync(transcriptFile, 'utf8'));
+  assert.equal(legacy.version, 1);
+  const legacyAt = legacy.updatedAt;
+  for (const event of [
+    { eventId: 'legacy-progress', type: 'stream', channel: 'commandOutput', itemId: 'legacy-command', text: 'keep me' },
+    { eventId: 'legacy-commentary-stream', type: 'stream', channel: 'agentMessage', itemId: 'legacy-commentary', text: 'working' },
+    { eventId: 'legacy-commentary-activity', type: 'activity', kind: 'commentary', phase: 'completed', itemId: 'legacy-commentary', summary: { text: 'working' } },
+    { eventId: 'legacy-answer-stream', type: 'stream', channel: 'agentMessage', itemId: 'legacy-final', text: 'Finished.' },
+    { eventId: 'legacy-answer', type: 'answer', text: 'Finished.\n\n[codex-thread threadId=legacy resumed=true]\n[CONTEXT_WARNING] example' },
+  ]) legacy.events.push({ ...event, seq: ++legacy.nextSeq, at: legacyAt, jobId, turnId: 'legacy-turn' });
+  writeFileSync(transcriptFile, JSON.stringify(legacy));
   const restarted = startMcpServer(env);
   try {
     const restored = monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, limit: 5 }));
     assert.equal(restored.conversation.status, 'completed_unclaimed');
     assert.equal(restored.liveJob, null);
     assert.deepEqual(restored.fileLinks, [{ path: 'inside.txt', uri: pathToFileURL(inside).href }]);
+    const reset = monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, afterSeq: legacy.nextSeq, cursorEpoch: priorEpoch, limit: 1 }));
+    assert.notEqual(reset.cursorEpoch, priorEpoch);
+    assert.equal(reset.reset, true);
+    assert.equal(reset.events[0].eventId, restored.events[0].eventId);
+    const recoveredOnDisk = JSON.parse(readFileSync(transcriptFile, 'utf8'));
+    const patched = recoveredOnDisk.events.filter((event) => event.seq > legacy.nextSeq);
+    assert.equal(patched.length, 3);
+    assert.ok(patched.every((event) => event.done === true && event.startedAt === legacyAt));
+    assert.deepEqual(patched.map((event) => [event.eventId, event.text, event.supersededBy]), [
+      ['legacy-progress', 'keep me', undefined],
+      ['legacy-commentary-stream', '', 'legacy-commentary-activity'],
+      ['legacy-answer-stream', '', 'legacy-answer'],
+    ]);
     assert.equal((await restarted.callTool('codex_ui_action', { action: 'clear_history', conversationId })).isError, true);
     assert.ok(!(await restarted.callTool('subagent_codex_wait', { jobId })).isError);
     assert.equal(monitorPayload(await restarted.callTool('codex_ui_get_conversation', { conversationId, afterSeq: restored.nextSeq, limit: 1 })).events.length, 1);
@@ -1724,6 +1844,216 @@ await test('21. UI compact, fork, close, and guarded history deletion', async ()
     assert.equal((await srv.callTool('codex_ui_get_conversation', { conversationId: ephemeralId })).isError, true);
   } finally {
     await srv.stop();
+  }
+});
+
+await test('22. Monitor settings sync Codex config and models, validate writes, and evict warm workers', async () => {
+  const dir = path.join(TEST_WORK_DIR, 'monitor-settings');
+  mkdirSync(dir);
+  const initial = { model: 'mock-codex-pro', reasoningEffort: 'ultra' };
+  const env = monitorEnv(dir, {
+    CODEX_MODEL: undefined,
+    CODEX_REASONING_EFFORT: undefined,
+    CODEX_WARM_IDLE_MS: '60000',
+    CODEX_HOME: path.join(dir, 'mock'),
+    MOCK_CODEX_CONFIG_MODEL: initial.model,
+    MOCK_CODEX_CONFIG_EFFORT: initial.reasoningEffort,
+  });
+  const factory = {
+    version: 1, updatedAt: null,
+    roles: { gemini: { name: null, avatar: null }, codex: { name: null, avatar: null } },
+    codex: { model: null, reasoningEffort: null },
+  };
+  const { createSettingsStore, resolveIsolatedSettingsPath } = await import('../mcp/settings-store.mjs');
+  const settingsPath = resolveIsolatedSettingsPath(env.CODEX_SESSION_STORE_PATH);
+  assert.match(path.basename(settingsPath), /^sessions-[a-f0-9]{12}\.json$/);
+  assert.notEqual(settingsPath, resolveIsolatedSettingsPath(path.join(dir, 'sessions.db')));
+  const blockedDir = path.join(dir, 'blocked');
+  writeFileSync(blockedDir, 'not a directory');
+  const blockedStore = createSettingsStore(path.join(blockedDir, 'settings.json'));
+  assert.throws(() => blockedStore.update({ codex: { model: 'not-saved' } }));
+  assert.deepEqual(blockedStore.get(), factory);
+
+  const configPath = path.join(env.MOCK_CODEX_STATE_DIR, 'mock-codex-config.json');
+  const writesPath = path.join(env.MOCK_CODEX_STATE_DIR, 'mock-config-writes.txt');
+  const readConfig = () => JSON.parse(readFileSync(configPath, 'utf8'));
+  const writeCount = () => Number(readFileSync(writesPath, 'utf8'));
+  const get = async (srv, args) => monitorPayload(await srv.callTool('codex_ui_get_settings', args));
+  const update = async (srv, patch) => monitorPayload(await srv.callTool('codex_ui_update_settings', patch));
+  const run = async (srv, expected, overrides = {}) => {
+    const { res } = await callAndWait(srv, {
+      description: 'Settings runtime defaults', prompt: '{}', cwd: dir,
+      sessionKey: 'settings-session', permissionMode: 'read-only', ...overrides,
+    });
+    assert.ok(!res.isError, toolText(res));
+    const text = toolText(res);
+    const { model, turnModel, effort, pid } = JSON.parse(text.split('\n\n[codex-thread')[0]);
+    assert.deepEqual({ model, turnModel, effort }, { model: expected.model, turnModel: expected.model, effort: expected.reasoningEffort });
+    assert.ok(Number.isInteger(pid) && pid > 0);
+    return { text, pid };
+  };
+
+  let saved;
+  const runtime = { model: 'mock-codex-fast', reasoningEffort: 'max' };
+  const resumedRuntime = { model: 'mock-codex-mini', reasoningEffort: 'high' };
+  const explicit = { model: 'explicit-model', reasoningEffort: 'xhigh' };
+  const srv = startMcpServer(env);
+  try {
+    const cached = await get(srv, { syncCodex: false });
+    assert.deepEqual(cached.settings, factory);
+    assert.equal(cached.codexConfig.synced, false);
+    assert.deepEqual(cached.options.models, []);
+    assert.equal(existsSync(env.MOCK_CODEX_STATE_DIR), false, 'cached read must not spawn app-server');
+
+    const synced = await get(srv);
+    assert.equal(synced.codexConfig.synced, true);
+    assert.equal(synced.codexConfig.catalogAvailable, true);
+    assert.equal(synced.codexConfig.error, null);
+    assert.equal(synced.codexConfig.catalogDefaultModel, initial.model);
+    assert.equal(synced.codexConfig.catalogDefaultReasoningEffort, 'low');
+    assert.deepEqual(synced.settings.codex, initial);
+    assert.deepEqual(synced.defaults, { ...initial, envModel: null, envReasoningEffort: null });
+    assert.deepEqual(synced.effective, initial);
+    assert.deepEqual(synced.options.reasoningEfforts, ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    assert.deepEqual(synced.options.models.map((entry) => entry.model), ['mock-codex-pro', 'mock-codex-fast', 'mock-codex-mini']);
+    const flagship = synced.options.models[0];
+    assert.equal(flagship.displayName, 'Mock Codex Pro');
+    assert.equal(flagship.isDefault, true);
+    assert.deepEqual(flagship.supportedReasoningEfforts.slice(-2), [
+      { reasoningEffort: 'max', description: 'Maximum reasoning' },
+      { reasoningEffort: 'ultra', description: 'Maximum with delegation' },
+    ]);
+
+    const external = { model: 'mock-codex-pro', model_reasoning_effort: 'medium' };
+    writeFileSync(configPath, JSON.stringify(external));
+    assert.deepEqual((await get(srv, { syncCodex: false })).settings.codex, initial);
+    assert.equal((await get(srv, { syncCodex: true })).codexConfig.reasoningEffort, 'medium');
+
+    const preset = { type: 'preset', value: 'spark' };
+    const codexAvatar = { type: 'preset', value: 'terminal' };
+    const first = await update(srv, {
+      roles: { gemini: { name: '  Ge\u0000mini\u200B  ', avatar: preset }, codex: { name: 'Codex', avatar: codexAvatar } },
+      codex: { model: ' mock-codex-fast ', reasoningEffort: ' max ' },
+    });
+    assert.deepEqual(first.settings.roles, { gemini: { name: 'Gemini', avatar: preset }, codex: { name: 'Codex', avatar: codexAvatar } });
+    assert.deepEqual(first.settings.codex, runtime);
+    assert.deepEqual(first.effective, runtime);
+    assert.equal(first.codexConfig.model, runtime.model);
+    assert.equal(first.codexConfig.reasoningEffort, runtime.reasoningEffort);
+    assert.equal(first.codexConfig.catalogDefaultReasoningEffort, 'medium');
+    assert.equal(Object.hasOwn(first.codexConfig, 'filePath'), false);
+    assert.equal(JSON.stringify(first).includes('mock-codex-config.json'), false);
+    assert.equal(new Date(first.settings.updatedAt).toISOString(), first.settings.updatedAt);
+    assert.deepEqual(readConfig(), { model: runtime.model, model_reasoning_effort: runtime.reasoningEffort });
+    assert.equal(writeCount(), 1);
+    await update(srv, { codex: runtime });
+    assert.equal(writeCount(), 1, 'unchanged values must not be written again');
+
+    const firstRun = await run(srv, runtime);
+    assert.equal((await run(srv, runtime)).pid, firstRun.pid, 'worker should be warm before settings change');
+    await update(srv, { codex: resumedRuntime });
+    const resumed = await run(srv, resumedRuntime);
+    assert.match(resumed.text, /resumed=true/);
+    assert.notEqual(resumed.pid, firstRun.pid);
+    assert.equal((await run(srv, resumedRuntime)).pid, resumed.pid, 'eviction must leave the pool enabled');
+    await run(srv, explicit, explicit);
+
+    const writesBeforeRoles = writeCount();
+    const emoji = { type: 'emoji', value: '\u{1F469}\u200D\u2695\uFE0F' };
+    assert.deepEqual((await update(srv, {
+      roles: { gemini: { avatar: { ...emoji, value: ' \u200B' + emoji.value + '\n ' } } },
+    })).settings.roles.gemini.avatar, emoji);
+    const image = { type: 'image', value: 'data:image/png;base64,' + PNG_1X1_BASE64 };
+    assert.deepEqual((await update(srv, { roles: { gemini: { avatar: image } } })).settings.roles.gemini.avatar, image);
+    assert.equal(writeCount(), writesBeforeRoles, 'roles-only updates must not write Codex config');
+    const beforeInvalid = await get(srv, { syncCodex: false });
+    saved = { ...beforeInvalid.settings, codex: factory.codex };
+    const savedSettingsText = readFileSync(settingsPath, 'utf8');
+    const savedConfigText = readFileSync(configPath, 'utf8');
+    assert.deepEqual(JSON.parse(savedSettingsText), saved);
+    const invalidAvatars = [
+      { type: 'image', value: 'data:image/svg+xml;base64,AAAA' },
+      { type: 'image', value: 'https://example.com/a.png' },
+      { type: 'image', value: 'data:image/png;base64,' + 'A'.repeat(65536) },
+      { type: 'image', value: 'data:image/png;base64,A===' },
+      { type: 'preset', value: 'unknown' }, { type: 'preset' }, { type: 'preset', value: 'spark', extra: true },
+      { type: 'emoji', value: '\u200B' }, { type: 'emoji', value: '\u2764'.repeat(12) },
+    ];
+    for (const patch of [
+      ...invalidAvatars.map((avatar) => ({ roles: { gemini: { avatar } }, codex: runtime })),
+      { reset: 'true' }, { roles: [] }, { codex: null }, { codex: { reasoningEffort: 'bogus' } },
+      { roles: { gemini: { name: 'x'.repeat(41) } }, codex: runtime }, { codex: { model: 'two words' } },
+      { reset: true, codex: { reasoningEffort: 'bogus' } },
+      { unknown: true }, { roles: { other: {} } }, { roles: { gemini: { unknown: true } } }, { codex: { unknown: true } },
+    ]) {
+      assert.equal((await srv.callTool('codex_ui_update_settings', patch)).isError, true);
+    }
+    assert.deepEqual(await get(srv, { syncCodex: false }), beforeInvalid);
+    assert.equal(readFileSync(settingsPath, 'utf8'), savedSettingsText);
+    assert.equal(readFileSync(configPath, 'utf8'), savedConfigText);
+    assert.equal(writeCount(), writesBeforeRoles);
+  } finally {
+    await srv.stop();
+  }
+
+  const failing = startMcpServer({ ...env, MOCK_CODEX_CONFIG_WRITE_FAIL: '1' });
+  try {
+    const savedSettingsText = readFileSync(settingsPath, 'utf8');
+    const savedConfigText = readFileSync(configPath, 'utf8');
+    const writesBeforeFailure = writeCount();
+    const failed = await failing.callTool('codex_ui_update_settings', {
+      codex: runtime,
+      roles: { codex: { name: 'Unsaved' } },
+    });
+    assert.equal(failed.isError, true);
+    assert.match(toolText(failed), /mock config write error/);
+    assert.deepEqual((await get(failing, { syncCodex: false })).settings, saved);
+    assert.equal(readFileSync(settingsPath, 'utf8'), savedSettingsText);
+    assert.equal(readFileSync(configPath, 'utf8'), savedConfigText);
+    assert.equal(writeCount(), writesBeforeFailure);
+  } finally {
+    await failing.stop();
+  }
+
+  const restarted = startMcpServer(env);
+  try {
+    // Native defaults apply immediately after restart, even without a Monitor sync.
+    const nativeSession = { sessionKey: 'native-after-restart' };
+    const native = await run(restarted, resumedRuntime, nativeSession);
+    assert.equal((await run(restarted, resumedRuntime, nativeSession)).pid, native.pid);
+    const codexToml = path.join(env.CODEX_HOME, 'config.toml');
+    writeFileSync(codexToml, 'model_reasoning_effort = "medium"\n');
+    writeFileSync(configPath, JSON.stringify({ model: resumedRuntime.model, model_reasoning_effort: 'medium' }));
+    const refreshed = await run(restarted, { ...resumedRuntime, reasoningEffort: 'medium' }, nativeSession);
+    assert.notEqual(refreshed.pid, native.pid, 'config.toml mtime must invalidate the warm worker');
+    assert.deepEqual((await get(restarted)).settings.roles, saved.roles);
+
+    const reset = await update(restarted, { reset: true });
+    assert.ok(reset.settings.updatedAt);
+    assert.deepEqual({ ...reset.settings, updatedAt: null }, factory);
+    assert.deepEqual(readConfig(), { model: null, model_reasoning_effort: null });
+    assert.equal(reset.codexConfig.synced, true);
+    assert.deepEqual(reset.effective, { model: initial.model, reasoningEffort: 'low' });
+    await run(restarted, { model: 'mock-codex-model', reasoningEffort: null }, { sessionKey: 'fresh-after-reset' });
+  } finally {
+    await restarted.stop();
+  }
+
+  const invalidFiles = [
+    '{ broken', JSON.stringify({ ...saved, version: 2 }), JSON.stringify({ ...saved, updatedAt: 'yesterday' }),
+    JSON.stringify({ ...saved, codex: { model: 'two words', reasoningEffort: null } }),
+  ];
+  for (const invalid of invalidFiles) {
+    writeFileSync(settingsPath, invalid);
+    const recovered = startMcpServer(env);
+    try {
+      assert.deepEqual((await get(recovered, { syncCodex: false })).settings, factory);
+      const repaired = await update(recovered, { roles: { codex: { name: 'Recovered' } } });
+      assert.equal(repaired.settings.roles.codex.name, 'Recovered');
+      assert.deepEqual(JSON.parse(readFileSync(settingsPath, 'utf8')), repaired.settings);
+    } finally {
+      await recovered.stop();
+    }
   }
 });
 
